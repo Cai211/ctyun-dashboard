@@ -2331,7 +2331,39 @@ function rewardNeedsDesktop(prodId, prodType) {
     return new OrigWorker(scriptUrl, options);
   };
 
-  // 6. 前台网页生命周期与心跳保活双向感知感知探针
+  // 6. 移动端横屏沉浸式全屏视图注入 (CSS + 屏幕旋转自适应与触控手势防阻断)
+  const isMobileView = /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent) || window.innerWidth <= 768;
+  if (isMobileView) {
+    const mobileStyle = document.createElement('style');
+    mobileStyle.innerHTML = \`
+      html, body {
+        width: 100vw !important;
+        height: 100vh !important;
+        margin: 0 !important;
+        padding: 0 !important;
+        overflow: hidden !important;
+        background: #000000 !important;
+        touch-action: none !important;
+        -webkit-user-select: none !important;
+        user-select: none !important;
+      }
+      #app, .desktop-container, canvas, video {
+        width: 100vw !important;
+        height: 100vh !important;
+        max-width: 100vw !important;
+        max-height: 100vh !important;
+        object-fit: contain !important;
+      }
+    \`;
+    document.head.appendChild(mobileStyle);
+
+    // 请求全屏与横屏锁定 (若移动端浏览器支持)
+    if (screen.orientation && screen.orientation.lock) {
+      screen.orientation.lock('landscape').catch(() => {});
+    }
+  }
+
+  // 7. 前台网页生命周期与心跳保活双向感知感知探针
   // 打开页面每 5 秒发送心跳证明用户正在操作；页面关闭/离开时立即通知后台恢复保活守护
   const accId = ${JSON.stringify(acc.id)};
   const token = ${JSON.stringify(session.token || '')};
@@ -2353,7 +2385,7 @@ function rewardNeedsDesktop(prodId, prodType) {
 </script>
 `;
 
-      html = html.replace('<head>', '<head><title>天翼云电脑 - ' + (acc.name || acc.user) + '</title>' + injectScript);
+      html = html.replace('<head>', '<head><meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover"><title>天翼云电脑 - ' + (acc.name || acc.user) + '</title>' + injectScript);
       html = html.replace(/src="static\//g, 'src="/ctyun-static/static/');
       html = html.replace(/src="\.\/static\//g, 'src="/ctyun-static/static/');
       html = html.replace(/href="\.\/static\//g, 'href="/ctyun-static/static/');

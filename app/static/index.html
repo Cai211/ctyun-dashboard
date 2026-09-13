@@ -114,26 +114,29 @@
             <div class="mac-dot mac-dot-yellow"></div>
             <div class="mac-dot mac-dot-green"></div>
           </div>
-          <span style="font-weight: 700; font-size: 13px; margin-left: 6px;">实时控制台日志</span>
-          <span class="badge badge-online" id="log-status" style="margin-left: 4px;">已连接</span>
-          
+          <span class="log-title">实时控制台日志</span>
+          <span class="badge badge-online" id="log-status">已连接</span>
+        </div>
+        
+        <div class="log-header-controls">
           <!-- 平台快速过滤子按钮 -->
-          <div style="display: flex; gap: 4px; margin-left: 10px; background: #f1f5f9; padding: 2px 3px; border-radius: var(--radius-sm); border: 1px solid var(--border);">
+          <div class="log-filter-group" id="log-platform-group">
             <button class="btn btn-sm btn-primary" id="tab-platform-all" onclick="switchPlatformFilter('all')">🌐 全部</button>
             <button class="btn btn-sm" id="tab-platform-ctyun" onclick="switchPlatformFilter('ctyun')">☁️ 天翼云</button>
             <button class="btn btn-sm" id="tab-platform-ydpc" onclick="switchPlatformFilter('ydpc')">📱 移动云</button>
           </div>
 
           <!-- 业务事件子按钮 -->
-          <div style="display: flex; gap: 4px; margin-left: 6px;">
+          <div class="log-filter-group" id="log-event-group">
             <button class="btn btn-sm btn-primary" id="tab-tasks" onclick="switchLogFilter('tasks')">🎯 任务</button>
             <button class="btn btn-sm" id="tab-heartbeat" onclick="switchLogFilter('heartbeat')">📡 心跳保活</button>
             <button class="btn btn-sm" id="tab-all" onclick="switchLogFilter('all')">📄 全部</button>
           </div>
-        </div>
-        <div style="display: flex; gap: 8px;">
-          <button class="btn btn-sm" onclick="clearLogs()">清屏</button>
-          <button class="btn btn-sm" id="btn-autoscroll" onclick="toggleAutoScroll()">自动滚动: 开</button>
+
+          <div class="log-action-group">
+            <button class="btn btn-sm" onclick="clearLogs()">清屏</button>
+            <button class="btn btn-sm" id="btn-autoscroll" onclick="toggleAutoScroll()">自动滚动: 开</button>
+          </div>
         </div>
       </div>
       <div class="log-content" id="log-content">
@@ -807,15 +810,15 @@
         <p style="font-size: 13px; color: var(--text-muted); margin-bottom: 6px;">
           管理员可以查看所有已注册用户，修改任何用户的云电脑添加配额（调高或调低数量限制）。
         </p>
-        <div style="overflow-x: auto;">
-          <table style="width: 100%; border-collapse: collapse; font-size: 13px; text-align: left;">
+        <div style="overflow-x: auto; width: 100%; -webkit-overflow-scrolling: touch;">
+          <table class="responsive-table" style="width: 100%; min-width: 580px; border-collapse: collapse; font-size: 13px; text-align: left;">
             <thead>
-              <tr style="border-bottom: 1px solid var(--border); color: var(--accent);">
-                <th style="padding: 8px;">用户名</th>
-                <th style="padding: 8px;">角色</th>
-                <th style="padding: 8px;">已添加云电脑</th>
-                <th style="padding: 8px;">允许添加上限(配额)</th>
-                <th style="padding: 8px;">操作</th>
+              <tr style="border-bottom: 1px solid var(--border); color: var(--accent); white-space: nowrap;">
+                <th style="padding: 10px 8px; white-space: nowrap;">用户名</th>
+                <th style="padding: 10px 8px; white-space: nowrap;">角色</th>
+                <th style="padding: 10px 8px; white-space: nowrap;">已添加云电脑</th>
+                <th style="padding: 10px 8px; white-space: nowrap;">允许添加上限(配额)</th>
+                <th style="padding: 10px 8px; white-space: nowrap; text-align: right; pr-2">操作</th>
               </tr>
             </thead>
             <tbody id="admin-users-tbody">

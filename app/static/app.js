@@ -444,14 +444,14 @@ function buildOfficialTasksHtml(m) {
       }
 
       return `
-        <div style="background: #ffffff; padding: 10px 14px; border-radius: 8px; border: 1px solid var(--border); box-shadow: 0 1px 3px rgba(0,0,0,0.02);">
-          <div style="display: flex; justify-content: space-between; font-size: 12.5px; margin-bottom: 6px;">
-            <span>🎯 <b style="color:#0f172a;">${t.name}</b> <span style="color:#2563eb; font-weight:600;">(+${t.points}分)</span></span>
-            <span style="color: ${isDone ? '#16a34a' : '#d97706'}; font-weight: 700;">
+        <div style="background: #ffffff; padding: 8px 10px; border-radius: 6px; border: 1px solid var(--border); box-shadow: 0 1px 2px rgba(0,0,0,0.02);">
+          <div style="display: flex; justify-content: space-between; align-items: center; font-size: 12px; margin-bottom: 5px; gap: 6px;">
+            <span style="min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">🎯 <b style="color:#0f172a;">${t.name}</b> <span style="color:#2563eb; font-weight:600;">(+${t.points}分)</span></span>
+            <span style="color: ${isDone ? '#16a34a' : '#d97706'}; font-weight: 700; flex-shrink: 0; font-size: 11px;">
               ${isDone ? '✅ 已达成' : '⏳ ' + progressText}
             </span>
           </div>
-          <div style="background: #e2e8f0; height: 6px; border-radius: 4px; overflow: hidden;">
+          <div style="background: #e2e8f0; height: 5px; border-radius: 4px; overflow: hidden;">
             <div style="background: ${isDone ? '#16a34a' : '#2563eb'}; width: ${percent}%; height: 100%; transition: width 0.3s ease;"></div>
           </div>
         </div>
@@ -566,25 +566,25 @@ function buildAccountCardElement(acc, slotIndex) {
       ${vmsHtml}
 
       <!-- 📡 移动云专属 CAG 握手与心跳监视 -->
-      <div style="background: var(--bg-card); border: 1px solid var(--border); border-radius: 8px; padding: 12px 14px; font-size: 12px;">
-        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px;">
-          <span style="color: #0369a1; font-weight: 700;">📡 移动云 ZTEC 握手与心跳监视</span>
-          <span id="acc-status-badge-${acc.id}">${statusBadge}</span>
+      <div style="background: var(--bg-card); border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; font-size: 12px;">
+        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px; gap: 6px; flex-wrap: wrap;">
+          <span style="color: #0369a1; font-weight: 700; flex-shrink: 0;">📡 移动云 ZTEC 握手与心跳监视</span>
+          <span id="acc-status-badge-${acc.id}" style="flex-shrink: 0;">${statusBadge}</span>
         </div>
-        <div style="color: #475569; line-height: 1.8;">
-          <div style="display: flex; align-items: baseline; gap: 4px; overflow: hidden; white-space: nowrap;">
-            <span style="flex-shrink: 0;">当前动作:</span>
-            <span id="acc-hb-text-${acc.id}" title="${escapeHtml(m.lastHeartbeatResult || '保活巡检待命')}" style="color: #0284c7; font-weight: 600; text-overflow: ellipsis; overflow: hidden; white-space: nowrap; flex: 1; cursor: help;">${escapeHtml(m.lastHeartbeatResult || '保活巡检待命')}</span>
+        <div style="color: #475569; line-height: 1.7; display: flex; flex-direction: column; gap: 3px;">
+          <div style="display: flex; align-items: baseline; gap: 4px; overflow: hidden; white-space: nowrap; min-width: 0;">
+            <span style="flex-shrink: 0; font-size: 11.5px; color: #64748b;">当前动作:</span>
+            <span id="acc-hb-text-${acc.id}" title="${escapeHtml(m.lastHeartbeatResult || '保活巡检待命')}" style="color: #0284c7; font-weight: 600; text-overflow: ellipsis; overflow: hidden; white-space: nowrap; flex: 1; min-width: 0; cursor: help;">${escapeHtml(m.lastHeartbeatResult || '保活巡检待命')}</span>
           </div>
-          <div id="acc-active-info-${acc.id}">上次活跃: <span style="color: #0f172a; font-weight: 600;">${m.lastHeartbeatTime || acc.stats?.lastKeepAliveTime || '刚刚'}</span> · 周期: <b>${Math.round((acc.keepaliveInterval || 600) / 60)} 分钟</b></div>
+          <div id="acc-active-info-${acc.id}" style="font-size: 11.5px; color: #475569; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">上次活跃: <span style="color: #0f172a; font-weight: 600;">${m.lastHeartbeatTime || acc.stats?.lastKeepAliveTime || '刚刚'}</span> · 周期: <b>${Math.round((acc.keepaliveInterval || 600) / 60)} 分钟</b></div>
         </div>
       </div>
 
       <!-- 专属功能开关 (精致折叠设计，状态持久化) -->
-      <details class="features-box" style="padding: 10px 14px;" ${isDetailsOpen(acc.id, 'features') ? 'open' : ''} ontoggle="saveDetailsState('${acc.id}', 'features', this.open)">
-        <summary style="display: flex; justify-content: space-between; align-items: center; cursor: pointer; font-size: 12.5px; font-weight: 700; color: #334155; user-select: none; margin-bottom: 2px;">
-          <span>⚙️ 自动化保活开关</span>
-          <span style="font-size: 11px; color: var(--text-muted); font-weight: normal;">点击收起/展开</span>
+      <details class="features-box" ${isDetailsOpen(acc.id, 'features') ? 'open' : ''} ontoggle="saveDetailsState('${acc.id}', 'features', this.open)">
+        <summary style="display: flex; justify-content: space-between; align-items: center; cursor: pointer; font-size: 12.5px; font-weight: 700; color: #334155; user-select: none; gap: 6px;">
+          <span style="min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">⚙️ 自动化保活开关</span>
+          <span style="font-size: 11px; color: var(--text-muted); font-weight: normal; flex-shrink: 0; white-space: nowrap;">点击收起/展开</span>
         </summary>
         <div style="display: flex; flex-direction: column; gap: 8px; margin-top: 8px;">
           <div class="feature-row">
@@ -743,44 +743,44 @@ function buildAccountCardElement(acc, slotIndex) {
     ${desktopsHtml}
 
     <!-- 📡 真实 WebSocket 保活心跳状态监视 -->
-    <div style="background: var(--bg-card); border: 1px solid var(--border); border-radius: 8px; padding: 12px 14px; font-size: 12px;">
-      <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px;">
-        <span style="color: #2563eb; font-weight: 700;">📡 状态与心跳监视</span>
-        <span id="acc-countdown-${acc.id}" style="color: var(--text-muted);">${f.cloudHang && !(m.officialTasks?.find(t => t.name.includes('使用1小时'))?.status === 2) ? `模式: <b style="color:#d97706;">持续挂机累加</b> (剩余: <b style="color:#2563eb;">${m.cycleCountdown || 0}s</b>)` : `脉冲间隔: <b>${acc.pulseIntervalSeconds || 30}s</b> (脉冲倒计时: <b style="color:#16a34a;">${m.cycleCountdown || 30}s</b>)`}</span>
+    <div style="background: var(--bg-card); border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; font-size: 12px;">
+      <div style="display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 6px; gap: 6px; flex-wrap: wrap;">
+        <span style="color: #2563eb; font-weight: 700; flex-shrink: 0;">📡 状态与心跳监视</span>
+        <span id="acc-countdown-${acc.id}" style="color: var(--text-muted); font-size: 11px; text-align: right; flex-shrink: 1;">${f.cloudHang && !(m.officialTasks?.find(t => t.name.includes('使用1小时'))?.status === 2) ? `模式: <b style="color:#d97706;">持续挂机累加</b> (剩余: <b style="color:#2563eb;">${m.cycleCountdown || 0}s</b>)` : `脉冲间隔: <b>${acc.pulseIntervalSeconds || 30}s</b> (倒计时: <b style="color:#16a34a;">${m.cycleCountdown || 30}s</b>)`}</span>
       </div>
-      <div style="color: #475569; line-height: 1.8;">
-        <div style="display: flex; align-items: baseline; gap: 4px; overflow: hidden; white-space: nowrap;">
-          <span style="flex-shrink: 0;">目标设备:</span>
-          <span id="acc-host-${acc.id}" title="${targetDeviceDisplay}" style="color: #0f172a; font-weight: 600; text-overflow: ellipsis; overflow: hidden; white-space: nowrap; flex: 1; cursor: help;">${targetDeviceDisplay}</span>
+      <div style="color: #475569; line-height: 1.7; display: flex; flex-direction: column; gap: 3px;">
+        <div style="display: flex; align-items: baseline; gap: 4px; overflow: hidden; white-space: nowrap; min-width: 0;">
+          <span style="flex-shrink: 0; font-size: 11.5px; color: #64748b;">目标设备:</span>
+          <span id="acc-host-${acc.id}" title="${targetDeviceDisplay}" style="color: #0f172a; font-weight: 600; text-overflow: ellipsis; overflow: hidden; white-space: nowrap; flex: 1; min-width: 0; cursor: help;">${targetDeviceDisplay}</span>
         </div>
-        <div style="display: flex; align-items: baseline; gap: 4px; overflow: hidden; white-space: nowrap;">
-          <span style="flex-shrink: 0;">当前动作:</span>
-          <span id="acc-hb-text-${acc.id}" title="${escapeHtml(m.lastHeartbeatResult || '正在建立心跳通道...')}" style="color: ${(m.lastHeartbeatResult || '').includes('避让') ? '#d97706' : '#16a34a'}; font-weight: 600; text-overflow: ellipsis; overflow: hidden; white-space: nowrap; flex: 1; cursor: help;">${escapeHtml(m.lastHeartbeatResult || '正在建立心跳通道...')}</span>
+        <div style="display: flex; align-items: baseline; gap: 4px; overflow: hidden; white-space: nowrap; min-width: 0;">
+          <span style="flex-shrink: 0; font-size: 11.5px; color: #64748b;">当前动作:</span>
+          <span id="acc-hb-text-${acc.id}" title="${escapeHtml(m.lastHeartbeatResult || '正在建立心跳通道...')}" style="color: ${(m.lastHeartbeatResult || '').includes('避让') ? '#d97706' : '#16a34a'}; font-weight: 600; text-overflow: ellipsis; overflow: hidden; white-space: nowrap; flex: 1; min-width: 0; cursor: help;">${escapeHtml(m.lastHeartbeatResult || '正在建立心跳通道...')}</span>
         </div>
-        <div>成功轮次: <span id="acc-success-count-${acc.id}" style="color: #2563eb; font-weight: 600;">${m.successCount || 0} 轮</span></div>
+        <div style="font-size: 11.5px; color: #475569;">成功轮次: <span id="acc-success-count-${acc.id}" style="color: #2563eb; font-weight: 600;">${m.successCount || 0} 轮</span></div>
       </div>
     </div>
 
     <!-- 🏆 天翼云官方真实任务看板 (精致可折叠设计，状态持久化) -->
-    <details style="background: #ffffff; border: 1px solid var(--border); border-radius: 8px; padding: 10px 14px; font-size: 13px;" ${isDetailsOpen(acc.id, 'tasks') ? 'open' : ''} ontoggle="saveDetailsState('${acc.id}', 'tasks', this.open)">
-      <summary style="display: flex; justify-content: space-between; align-items: center; cursor: pointer; font-weight: 700; user-select: none;">
-        <span style="color: #b45309;">🏆 官方任务进度 (总分: <b id="acc-points-val-${acc.id}" style="color:#16a34a;">${m.userPoints || 0}</b>)</span>
-        <span style="font-size: 11px; color: var(--text-muted); font-weight: normal;">点击收起/展开</span>
+    <details class="card-collapse-box" ${isDetailsOpen(acc.id, 'tasks') ? 'open' : ''} ontoggle="saveDetailsState('${acc.id}', 'tasks', this.open)">
+      <summary style="display: flex; justify-content: space-between; align-items: center; cursor: pointer; font-weight: 700; user-select: none; gap: 6px;">
+        <span style="color: #b45309; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">🏆 官方任务进度 (总分: <b id="acc-points-val-${acc.id}" style="color:#16a34a;">${m.userPoints || 0}</b>)</span>
+        <span style="font-size: 11px; color: var(--text-muted); font-weight: normal; flex-shrink: 0; white-space: nowrap;">点击收起/展开</span>
       </summary>
-      <div id="acc-tasks-list-${acc.id}" style="display: flex; flex-direction: column; gap: 6px; margin-top: 10px;">
+      <div id="acc-tasks-list-${acc.id}" style="display: flex; flex-direction: column; gap: 6px; margin-top: 8px;">
         ${officialTaskHtml}
       </div>
     </details>
 
     <!-- 功能开关 (精致折叠设计，状态持久化) -->
-    <details class="features-box" style="padding: 10px 14px;" ${isDetailsOpen(acc.id, 'features') ? 'open' : ''} ontoggle="saveDetailsState('${acc.id}', 'features', this.open)">
-      <summary style="display: flex; justify-content: space-between; align-items: center; cursor: pointer; font-size: 12.5px; font-weight: 700; color: #334155; user-select: none; margin-bottom: 2px;">
-        <span>⚙️ 自动化任务与保活开关</span>
-        <span style="font-size: 11px; color: var(--text-muted); font-weight: normal;">点击收起/展开</span>
+    <details class="features-box" ${isDetailsOpen(acc.id, 'features') ? 'open' : ''} ontoggle="saveDetailsState('${acc.id}', 'features', this.open)">
+      <summary style="display: flex; justify-content: space-between; align-items: center; cursor: pointer; font-size: 12.5px; font-weight: 700; color: #334155; user-select: none; gap: 6px;">
+        <span style="min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">⚙️ 自动化任务与保活开关</span>
+        <span style="font-size: 11px; color: var(--text-muted); font-weight: normal; flex-shrink: 0; white-space: nowrap;">点击收起/展开</span>
       </summary>
       <div style="display: flex; flex-direction: column; gap: 8px; margin-top: 8px;">
         <div class="feature-row">
-          <span>📡 启用云电脑保活 (${m.keepAliveSeconds || 60}s周期守护/${acc.pulseIntervalSeconds || 30}s旁观脉冲)</span>
+          <span>📡 启用云电脑保活 <small style="color:var(--text-muted);font-size:10.5px;">(${m.keepAliveSeconds || 60}s守护/${acc.pulseIntervalSeconds || 30}s脉冲)</small></span>
           <label class="switch">
             <input type="checkbox" ${f.keepAlive !== false ? 'checked' : ''} onchange="toggleFeature('${acc.id}', 'keepAlive', this.checked)">
             <span class="slider"></span>
@@ -809,7 +809,7 @@ function buildAccountCardElement(acc, slotIndex) {
         </div>
         <div class="feature-row">
           <span>🎁 自动兑换/抽奖 (${acc.redeemConfig?.enabled ? '<b style=\"color:#16a34a\">已开</b>' : '未开'})</span>
-          <button class="btn btn-sm btn-warning" onclick="openRedeemModal('${acc.id}')">⚙️ 奖品与抽奖设置</button>
+          <button class="btn btn-sm btn-warning" onclick="openRedeemModal('${acc.id}')" style="flex-shrink:0;padding:3px 8px;font-size:11.5px;">⚙️ 奖品设置</button>
         </div>
       </div>
     </details>
@@ -2319,7 +2319,7 @@ async function executePowerAction(action) {
 }
 
 // ==========================================
-// 弹窗浏览器免密直达访问云电脑 (自动匹配设定的分辨率与缩放)
+// 弹窗浏览器免密直达访问云电脑 (自动匹配设定的分辨率与缩放，手机端全屏横向沉浸)
 // ==========================================
 async function launchWebDesktop(accId, targetDesktopId = '') {
   const acc = accounts.find(a => a.id === accId);
@@ -2336,27 +2336,38 @@ async function launchWebDesktop(accId, targetDesktopId = '') {
       return;
     }
 
-    const winWidth = Math.min(window.screen.availWidth || 1920, 1920);
-    const winHeight = Math.min(window.screen.availHeight || 1080, 1080);
-    const left = Math.max(0, Math.round((window.screen.availWidth - winWidth) / 2));
-    const top = Math.max(0, Math.round((window.screen.availHeight - winHeight) / 2));
-
-    const windowFeatures = `width=${winWidth},height=${winHeight},left=${left},top=${top},menubar=no,toolbar=no,location=no,status=no,resizable=yes,scrollbars=yes`;
-    
-    // 构造直通操作界面 URL (自动免密注入与云电脑操作界面自适应)
     const token = currentAuthToken || localStorage.getItem('ctyun_auth_token') || '';
     const directViewParam = targetDesktopId ? `&desktopId=${encodeURIComponent(targetDesktopId)}` : '';
     const launchUrl = data.directViewUrl || `/desktop-view?accId=${accId}&token=${encodeURIComponent(token)}${directViewParam}`;
 
-    // 打开免密直通独立操作窗口
-    const popup = window.open(launchUrl, `ctyun_desktop_${accId}_${targetDesktopId || 'main'}`, windowFeatures);
+    // 智能设备检测：手机/移动端 (屏幕宽度 <= 768 或触屏移动设备)
+    const isMobile = /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent) || window.innerWidth <= 768;
 
-    if (popup) {
-      popup.focus();
-      showToast(`已为您直达打开【${data.desktopName}】云电脑操作界面！已自动完成免密鉴权。`, "success");
+    if (isMobile) {
+      // 移动端：直接全屏沉浸式在新标签页/全屏视图打开，充分利用手机全部横向像素！
+      const mobileWin = window.open(launchUrl, '_blank');
+      if (mobileWin) {
+        showToast(`📱 正在全屏打开【${data.desktopName}】操作界面！建议将手机横屏使用以获得最佳体验。`, "success");
+      } else {
+        window.location.href = launchUrl;
+      }
     } else {
-      showToast("弹窗被浏览器拦截，请在地址栏右侧允许本站点弹出窗口！", "warning");
-      window.open(launchUrl, '_blank');
+      // 桌面端：居中独立无边框弹窗
+      const winWidth = Math.min(window.screen.availWidth || 1920, 1920);
+      const winHeight = Math.min(window.screen.availHeight || 1080, 1080);
+      const left = Math.max(0, Math.round((window.screen.availWidth - winWidth) / 2));
+      const top = Math.max(0, Math.round((window.screen.availHeight - winHeight) / 2));
+      const windowFeatures = `width=${winWidth},height=${winHeight},left=${left},top=${top},menubar=no,toolbar=no,location=no,status=no,resizable=yes,scrollbars=yes`;
+
+      const popup = window.open(launchUrl, `ctyun_desktop_${accId}_${targetDesktopId || 'main'}`, windowFeatures);
+
+      if (popup) {
+        popup.focus();
+        showToast(`已为您直达打开【${data.desktopName}】云电脑操作界面！已自动完成免密鉴权。`, "success");
+      } else {
+        showToast("弹窗被浏览器拦截，请在地址栏右侧允许本站点弹出窗口！", "warning");
+        window.open(launchUrl, '_blank');
+      }
     }
   } catch (e) {
     showToast("访问请求异常: " + e.message, "error");
@@ -2724,11 +2735,7 @@ function createLogLineElement(item) {
   const repeatBadge = (item.repeatCount && item.repeatCount > 1) 
     ? `<span class="badge-repeat">x${item.repeatCount}</span>` 
     : '';
-  line.innerHTML = `
-    <span class="log-time">[${item.timestamp}]</span>
-    <span class="log-source">[${item.source}]</span>
-    <span class="log-text">${escapeHtml(item.message)}</span>${repeatBadge}
-  `;
+  line.innerHTML = `<span class="log-time">[${item.timestamp}]</span><span class="log-source">[${item.source}]</span><span class="log-text">${escapeHtml(item.message)}</span>${repeatBadge}`;
   return line;
 }
 
@@ -2797,11 +2804,7 @@ async function initLogStream() {
               existingLine.remove();
             } else {
               const repeatBadge = item.repeatCount > 1 ? `<span class="badge-repeat">x${item.repeatCount}</span>` : '';
-              existingLine.innerHTML = `
-                <span class="log-time">[${item.timestamp}]</span>
-                <span class="log-source">[${item.source}]</span>
-                <span class="log-text">${escapeHtml(item.message)}</span>${repeatBadge}
-              `;
+              existingLine.innerHTML = `<span class="log-time">[${item.timestamp}]</span><span class="log-source">[${item.source}]</span><span class="log-text">${escapeHtml(item.message)}</span>${repeatBadge}`;
               existingLine.classList.remove('log-flash');
               void existingLine.offsetWidth;
               existingLine.classList.add('log-flash');
@@ -3097,21 +3100,21 @@ async function openAdminUsersModal() {
       const isAdmin = u.role === "admin";
 
       tr.innerHTML = `
-        <td style="padding: 10px 8px; font-weight: 600;">${escapeHtml(u.username)}</td>
-        <td style="padding: 10px 8px;">
+        <td style="padding: 10px 8px; font-weight: 600; white-space: nowrap;">${escapeHtml(u.username)}</td>
+        <td style="padding: 10px 8px; white-space: nowrap;">
           <span class="badge ${isAdmin ? 'badge-online' : 'badge-offline'}">${isAdmin ? '超级管理员' : '普通用户'}</span>
         </td>
-        <td style="padding: 10px 8px; font-weight: 600; color: #38bdf8;">${u.accountsCount || 0} 台</td>
-        <td style="padding: 10px 8px;">
+        <td style="padding: 10px 8px; font-weight: 600; color: #38bdf8; white-space: nowrap;">${u.accountsCount || 0} 台</td>
+        <td style="padding: 10px 8px; white-space: nowrap;">
           <div style="display: flex; align-items: center; gap: 6px;">
-            <input type="number" class="form-control" style="width: 80px; padding: 4px 8px; font-size: 12px;" id="quota-input-${u.id}" value="${u.maxQuota || 2}" min="0">
-            <button class="btn btn-sm btn-primary" onclick="saveUserQuota('${u.id}')">保存配额</button>
+            <input type="number" class="form-control" style="width: 70px; padding: 4px 6px; font-size: 12px;" id="quota-input-${u.id}" value="${u.maxQuota || 2}" min="0">
+            <button class="btn btn-sm btn-primary" onclick="saveUserQuota('${u.id}')" style="white-space: nowrap; padding: 4px 8px;">保存配额</button>
           </div>
         </td>
-        <td style="padding: 10px 8px;">
-          <div style="display: flex; gap: 4px;">
-            <button class="btn btn-sm" onclick="openAdminSetPwdModal('${u.id}', '${u.username}')">修改密码</button>
-            ${!isAdmin ? `<button class="btn btn-sm btn-danger" onclick="deleteUserAccount('${u.id}', '${u.username}')">删除</button>` : ''}
+        <td style="padding: 10px 8px; white-space: nowrap; text-align: right;">
+          <div style="display: flex; gap: 4px; justify-content: flex-end;">
+            <button class="btn btn-sm" onclick="openAdminSetPwdModal('${u.id}', '${u.username}')" style="white-space: nowrap; padding: 4px 8px;">修改密码</button>
+            ${!isAdmin ? `<button class="btn btn-sm btn-danger" onclick="deleteUserAccount('${u.id}', '${u.username}')" style="white-space: nowrap; padding: 4px 8px;">删除</button>` : ''}
           </div>
         </td>
       `;
