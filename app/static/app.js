@@ -1708,13 +1708,13 @@ async function loadQrCodeForModal() {
         };
       }
 
-      // 启动 2 秒轮询看门狗 (携带用户填写的账号备注名与目标重登账号ID)
-      const nameVal = document.getElementById("qrcode-acc-name") ? document.getElementById("qrcode-acc-name").value.trim() : "";
+      // 启动 2 秒轮询看门狗 (每次轮询动态读取用户实时填写的账号备注名与目标重登账号ID)
       const currentAccId = document.getElementById("acc-id") ? document.getElementById("acc-id").value : "";
       const accIdParam = currentAccId ? `&accId=${encodeURIComponent(currentAccId)}` : "";
       qrPollingTimer = setInterval(async () => {
         try {
-          const sRes = await authFetch(`/api/account/qrcode/status?qrCodeId=${encodeURIComponent(currentQrCodeId)}&deviceCode=${encodeURIComponent(data.deviceCode)}&accountName=${encodeURIComponent(nameVal)}${accIdParam}`);
+          const currentNameVal = document.getElementById("qrcode-acc-name") ? document.getElementById("qrcode-acc-name").value.trim() : "";
+          const sRes = await authFetch(`/api/account/qrcode/status?qrCodeId=${encodeURIComponent(currentQrCodeId)}&deviceCode=${encodeURIComponent(data.deviceCode)}&accountName=${encodeURIComponent(currentNameVal)}${accIdParam}`);
           const sData = await sRes.json();
           if (sData.success) {
             if (sData.codeStatus === 'scaned') {
