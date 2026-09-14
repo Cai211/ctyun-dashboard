@@ -2928,11 +2928,14 @@ function rewardNeedsDesktop(prodId, prodType) {
     const online = visibleAccounts.filter(a => a.stats?.keepAliveStatus === 'online').length;
     const today = getBeijingDateOnly();
     const signed = visibleAccounts.filter(a => a.stats?.lastSignTime && a.stats.lastSignTime.startsWith(today)).length;
-    // 汇总该用户可见账号的今日已获得总积分 (按今日任务实际完成积分累加，上限每个账号 300 积分)
+    // 汇总该用户可见账号的今日已获得总积分 (仅统计天翼云电脑账号，移动云无积分体系)
     let totalTodayEarned = 0;
     const pointsDetails = [];
 
     for (const a of visibleAccounts) {
+      // 严格过滤：移动云电脑平台无积分与任务中心，直接跳过积分统计与明细展示
+      if (a.platform === 'ydpc') continue;
+
       const client = clientInstances.get(a.id);
       const tasks = client?.metrics?.officialTasks || [];
       let accTodayPoints = 0;
