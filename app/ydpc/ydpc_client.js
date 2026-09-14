@@ -159,7 +159,35 @@ class YdpcClient {
       return;
     }
 
+    // 智能限时/到期/全关机感知：若名下所有云电脑均已关机或 20 小时限时套餐已耗尽，绝不发起无效 MQTT 连接
+    const vms = this.account.vms || [];
+    const allOffOrExhausted = vms.length > 0 && vms.every(vm => {
+      const isVmOff = String(vm.vmStatus || '').includes('关机') || vm.vmStatusCode === 23 || vm.vmStatusCode === 16;
+      const isLimitedExpired = vm._durationExhausted || (
+        vm.durationMode === 'limited' && (
+          vm.remainHours <= 0 || 
+          (typeof vm.remainDurationTime === 'number' && vm.remainDurationTime <= 0) ||
+          String(vm.remainText || '').includes('0小时') ||
+          String(vm.remainText || '').includes('已耗尽')
+        )
+      );
+      return isVmOff || isLimitedExpired || vm.keepaliveEnabled === false;
+    });
+
+    if (allOffOrExhausted) {
+      if (this.mqttClient) {
+        this.mqttClient.disconnect();
+        this.mqttClient = null;
+      }
+      return;
+    }
+
     if (this.mqttClient && this.mqttClient.isConnected) {
+      return;
+    }
+
+    // 防频繁重试退避：若上次连接失败，至少冷却 5 分钟（300s）后再重试，绝不刷屏
+    if (this._lastMqttFailedAt && Date.now() - this._lastMqttFailedAt < 300000) {
       return;
     }
 
@@ -192,10 +220,12 @@ class YdpcClient {
         });
 
         await this.mqttClient.connect(10000);
+        this._lastMqttFailedAt = 0;
         this.appendLog('MQTT', `[${accName}] 🟢 官方 MQTT 3.1.1 over TLS 链路已连接保持 (Broker: ${host})`, 'success', accName, 'ydpc');
       }
     } catch (err) {
-      this.appendLog('MQTT', `[${accName}] MQTT 链路连接异常: ${err.message}`, 'warning', accName, 'ydpc');
+      this._lastMqttFailedAt = Date.now();
+      this.appendLog('MQTT', `[${accName}] MQTT 链路连接异常: ${err.message} (已转入5分钟静默退避)`, 'warning', accName, 'ydpc');
     }
   }
 
