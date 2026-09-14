@@ -923,7 +923,7 @@ function buildAccountCardElement(acc, slotIndex) {
       </summary>
       <div style="display: flex; flex-direction: column; gap: 8px; margin-top: 8px;">
         <div class="feature-row">
-          <span>📡 启用云电脑保活 <small style="color:var(--text-muted);font-size:10.5px;">(${m.keepAliveSeconds || 60}s守护/${acc.pulseIntervalSeconds || 30}s脉冲)</small></span>
+          <span>📡 启用云电脑保活</span>
           <label class="switch">
             <input type="checkbox" ${f.keepAlive !== false ? 'checked' : ''} onchange="toggleFeature('${acc.id}', 'keepAlive', this.checked)">
             <span class="slider"></span>
