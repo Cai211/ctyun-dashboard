@@ -608,6 +608,11 @@ class CtYunClient {
     this.wsAlive = false;
     this.encryptor = new CtYunEncryption();
     
+    const todayStr = getBeijingDateOnly();
+    const stats = account.stats || {};
+    this.lastSuccessDate = stats.lastSuccessDate || todayStr;
+    const initialTodayCount = (stats.lastSuccessDate === todayStr) ? (stats.todaySuccessCount || 0) : 0;
+
     this.metrics = {
       status: 'offline',
       currentHost: '',
@@ -616,7 +621,7 @@ class CtYunClient {
       cycleCountdown: 60,
       lastHeartbeatTime: '',
       lastHeartbeatResult: '未建立连接',
-      successCount: 0,
+      successCount: initialTodayCount,
       errorCount: 0,
       officialTasks: [],
       userPoints: 0
@@ -1124,7 +1129,25 @@ class CtYunClient {
       } catch (e) {}
 
       if (mergedList.length > 0) {
+        // 差量合并引擎 (Diff-Merge)：保留用户本地已设置的单机保活与任务偏好
+        const oldMap = new Map((this.account.desktops || this.desktopsCache || []).map(d => [String(d.desktopId || d.objId), d]));
+        for (const d of mergedList) {
+          const dKey = String(d.desktopId || d.objId);
+          const old = oldMap.get(dKey);
+          if (old) {
+            if (old.keepaliveEnabled !== undefined) d.keepaliveEnabled = old.keepaliveEnabled;
+            if (old.taskEnabled !== undefined) d.taskEnabled = old.taskEnabled;
+            if (old.autoBootEnabled !== undefined) d.autoBootEnabled = old.autoBootEnabled;
+            if (old.keepaliveInterval !== undefined) d.keepaliveInterval = old.keepaliveInterval;
+            if (old.lastPulseAt !== undefined) d.lastPulseAt = old.lastPulseAt;
+          } else {
+            if (d.keepaliveEnabled === undefined) d.keepaliveEnabled = true;
+            if (d.taskEnabled === undefined) d.taskEnabled = true;
+            if (d.autoBootEnabled === undefined) d.autoBootEnabled = true;
+          }
+        }
         this.desktopsCache = mergedList;
+        this.account.desktops = mergedList;
         for (const d of mergedList) this.checkExternalPowerOn(d);
         return mergedList;
       }
@@ -1580,8 +1603,17 @@ class CtYunClient {
         this.conflictRetryUntil = 0;
         this.wsAlive = true;
         this.metrics.status = 'online';
+
+        // 当日成功轮次按自然日 0 点重置统计
+        const todayStr = getBeijingDateOnly();
+        if (this.lastSuccessDate !== todayStr) {
+          this.metrics.successCount = 0;
+          this.lastSuccessDate = todayStr;
+        }
         this.metrics.successCount++;
         this.account.stats = this.account.stats || {};
+        this.account.stats.todaySuccessCount = this.metrics.successCount;
+        this.account.stats.lastSuccessDate = todayStr;
         this.account.stats.keepAliveStatus = 'online';
         saveConfig(appConfig);
 
@@ -1833,14 +1865,20 @@ class CtYunClient {
     }
 
     try {
-      // 4. 获取目标云电脑并确保开机
+      // 4. 获取目标云电脑并确保开机 (优先选择开启了任务与保活的云主机)
       const desktops = await this.getDesktops();
       if (!desktops || desktops.length === 0) {
         onLog('Hang', `[${accName}] 账号名下暂无可用云电脑，无法执行挂机任务。`, 'warning');
         return { success: false, isCompleted: false, message: '名下无云电脑' };
       }
 
-      const mainDesktop = desktops[0];
+      const activeDesktops = desktops.filter(d => d.taskEnabled !== false && d.keepaliveEnabled !== false);
+      const fallbackDesktops = desktops.filter(d => d.taskEnabled !== false);
+      if (activeDesktops.length === 0 && fallbackDesktops.length === 0) {
+        onLog('Hang', `[${accName}] 账号名下所有云电脑的【🎯 任务开关】均已关闭，本次挂机任务自动跳过。`, 'info');
+        return { success: true, isCompleted: false, message: '名下所有云电脑均已关闭任务开关' };
+      }
+      const mainDesktop = activeDesktops.length > 0 ? activeDesktops[0] : fallbackDesktops[0];
       const targetName = mainDesktop.objName || mainDesktop.desktopName || '云电脑';
       const isRunning = mainDesktop && (mainDesktop.useStatusText === '运行中' || mainDesktop.useStatus == 25);
 
@@ -1931,13 +1969,15 @@ class CtYunClient {
           continue;
         }
 
-        // 2. 遍历名下所有云电脑，检查开机/休眠状态并自动唤醒未启动机器 (多机全量守护)
+        // 2. 遍历名下所有云电脑，检查开机/休眠状态并自动唤醒未启动机器 (多机独立守护过滤)
         let hasWokenAny = false;
         for (const d of desktops) {
+          if (d.keepaliveEnabled === false) continue; // 用户关闭了该机独立保活
+          const isAutoBootAllowed = d.autoBootEnabled !== false;
           const isRunning = d && (d.useStatusText === '运行中' || d.useStatus == 25);
           const dId = d.objId || d.desktopId;
           const dName = d.objName || d.desktopName || '云电脑';
-          if (!isRunning) {
+          if (!isRunning && isAutoBootAllowed) {
             if (!this.account.manualShutdown) {
               const isDormant = (d.useStatusText || '').includes('休眠') || (d.useStatusText || '').includes('睡眠');
               const actionTarget = isDormant ? 'awake' : 'poweron';
@@ -1954,29 +1994,57 @@ class CtYunClient {
           continue;
         }
 
-        // 3. 运行中云电脑常态保活 (100% 纯旁观者脉冲防休眠，永不独占认领会话，绝不影响/争抢官方客户端)
+        // 3. 运行中云电脑常态保活 (多机高精度独立时间戳轮转引擎，100% 旁观者脉冲防休眠)
         this.bootWaitStartTime = null;
         this.metrics.status = 'online';
         if (this.account.stats) this.account.stats.keepAliveStatus = 'online';
 
-        // 脉冲防休眠模式：依次为名下每一台运行中的云电脑执行脉冲握手保活 (各保持 15~20 秒)
+        const defaultPulseGapSec = Math.min(3300, Math.max(10, parseInt(this.account.pulseIntervalSeconds || appConfig.settings?.pulseIntervalSeconds) || 30));
         const pulseConnectSec = Math.min(60, Math.max(15, appConfig.settings?.keepAliveSeconds || 20));
 
+        const now = Date.now();
         for (const d of desktops) {
           if (!this.workerRunning || this.isTaskHanging) break;
+          if (d.keepaliveEnabled === false) continue; // 单机独立保活关闭则跳过
+
+          // 获取该台天翼云电脑的独立脉冲周期 (未单独指定则继承账号/系统全局默认)
+          const dIntervalSec = Math.min(3300, Math.max(10, parseInt(d.keepaliveInterval) || defaultPulseGapSec));
+          const lastPulse = d.lastPulseAt || 0;
+          const elapsedSec = Math.floor((now - lastPulse) / 1000);
+
+          // 时间未到达该主机的专属脉冲周期，继续休眠跳过
+          if (lastPulse > 0 && elapsedSec < dIntervalSec) {
+            continue;
+          }
+
           const isRunning = d && (d.useStatusText === '运行中' || d.useStatus == 25);
           if (isRunning) {
             this.metrics.desktopId = d.objId || d.desktopId;
             this.metrics.desktopName = d.objName || d.desktopName || '云电脑';
+            appendLog('KeepAlive', `[${accName}][${this.metrics.desktopName}] 触发脉冲保活握手 (独立周期: ${dIntervalSec}秒)...`, 'info');
             await this.runDesktopKeepAliveSession(d, false, pulseConnectSec);
+            d.lastPulseAt = Date.now();
           }
         }
 
-        // 脉冲休眠间隔
-        const pulseGapSec = Math.min(3300, Math.max(10, parseInt(appConfig.settings?.pulseIntervalSeconds) || 30));
-        this.metrics.pulseIntervalSeconds = pulseGapSec;
+        // 计算所有有效保活主机的最短剩余倒计时，供前端看板实时呈现
+        const activeDesktops = desktops.filter(d => d.keepaliveEnabled !== false);
+        if (activeDesktops.length > 0) {
+          const nowTs = Date.now();
+          const countdowns = activeDesktops.map(d => {
+            const dInterval = Math.min(3300, Math.max(10, parseInt(d.keepaliveInterval) || defaultPulseGapSec));
+            const elapsed = Math.floor((nowTs - (d.lastPulseAt || 0)) / 1000);
+            return Math.max(0, dInterval - elapsed);
+          });
+          this.metrics.cycleCountdown = Math.min(...countdowns);
+        } else {
+          this.metrics.cycleCountdown = defaultPulseGapSec;
+        }
+
+        // 高精度时间轮时钟片休眠 (每 10 秒轮转一次)
         let waited = 0;
-        while (waited < pulseGapSec && this.workerRunning && !this.isTaskHanging) {
+        const tickStep = 10;
+        while (waited < tickStep && this.workerRunning && !this.isTaskHanging) {
           if (this.account.sessionExpired) break;
           if (this.isWebUserActive && Date.now() >= this.webUserActiveUntil) {
             this.isWebUserActive = false;
@@ -1984,18 +2052,13 @@ class CtYunClient {
           if (this.isWebUserActive && Date.now() < this.webUserActiveUntil) {
             this.metrics.lastHeartbeatResult = '浏览器用户操作中，脉冲计时已暂停';
             await new Promise(r => setTimeout(r, 5000));
-            waited = 0;
             continue;
           }
-          const remain = pulseGapSec - waited;
-          const remainText = remain >= 180 ? `约 ${Math.ceil(remain / 60)} 分钟` : `约 ${remain} 秒`;
-          const desktopNamesStr = desktops.map(d => d.objName || d.desktopName).filter(Boolean).join('、');
-          this.metrics.lastHeartbeatResult = `🟢 多机脉冲待机中 (名下 ${desktops.length} 台 [${desktopNamesStr}] 均已保活，${remainText}后下一轮脉冲)`;
-          await new Promise(r => setTimeout(r, 10000));
-          waited += 10;
+          await new Promise(r => setTimeout(r, 1000));
+          waited += 1;
         }
 
-        await this.refreshOfficialTasks();
+        await this.refreshOfficialTasks().catch(() => {});
 
       } catch (err) {
         appendLog('KeepAlive', `[${accName}] 保活异常: ${err.message}，10秒后重试...`, 'error');
@@ -2945,6 +3008,18 @@ function rewardNeedsDesktop(prodId, prodType) {
     // 智能状态同步：确保运行态指标状态准确反映长连接和机器实际状态
     for (const acc of userAccounts) {
       const client = getClient(acc);
+      if (client.lastSuccessDate) {
+        const todayStr = getBeijingDateOnly();
+        if (client.lastSuccessDate !== todayStr) {
+          client.metrics.successCount = 0;
+          client.lastSuccessDate = todayStr;
+          if (acc.stats) {
+            acc.stats.todaySuccessCount = 0;
+            acc.stats.lastSuccessDate = todayStr;
+          }
+        }
+      }
+
       if (acc.features?.keepAlive === false || acc.manualShutdown === true) {
         client.stopKeepAliveWorker();
         client.metrics.status = 'offline';
@@ -3135,6 +3210,7 @@ function rewardNeedsDesktop(prodId, prodType) {
           keepAlive: true,
           cagKeepAlive: true,
           sohoHeartbeat: true,
+          mqttKeepAlive: true,
           autoBoot
         },
         vms,
@@ -3282,6 +3358,88 @@ function rewardNeedsDesktop(prodId, prodType) {
     client.startKeepAliveWorker();
 
     jsonResponse(res, newAcc, 201);
+    return;
+  }
+
+  // 8.8 单台云电脑独立特性开关切换 API (支持移动云 VM 与天翼云 Desktop 独立保活与开机控制)
+  if (req.method === 'PUT' && pathname.match(/^\/api\/accounts\/([^\/]+)\/vm-feature$/)) {
+    const session = getSessionFromReq(req);
+    if (!session) {
+      jsonResponse(res, { error: '未授权：请登录后再操作' }, 401);
+      return;
+    }
+    const match = pathname.match(/^\/api\/accounts\/([^\/]+)\/vm-feature$/);
+    const accId = match[1];
+    const acc = appConfig.accounts.find(a => a.id === accId);
+    if (!acc) {
+      jsonResponse(res, { error: '账号不存在' }, 404);
+      return;
+    }
+
+    if (session.role !== 'admin' && acc.ownerId !== session.userId) {
+      jsonResponse(res, { error: '权限不足：无法操作属于其他用户的云电脑' }, 403);
+      return;
+    }
+
+    const body = await parseJsonBody(req);
+    const vmKey = String(body.vmId || body.desktopId || body.userServiceId || '');
+    const featureName = body.feature; // 'keepaliveEnabled' | 'autoBootEnabled' | 'taskEnabled' | 'keepaliveInterval'
+
+    if (!vmKey || !['keepaliveEnabled', 'autoBootEnabled', 'taskEnabled', 'keepaliveInterval'].includes(featureName)) {
+      jsonResponse(res, { error: '参数错误：必须提供有效的 vmId 与 feature' }, 400);
+      return;
+    }
+
+    let finalValue = body.value;
+    if (featureName === 'keepaliveInterval') {
+      const num = parseInt(body.value);
+      finalValue = (!isNaN(num) && num > 0) ? num : null;
+    } else {
+      finalValue = body.value !== false;
+    }
+
+    let updatedTarget = null;
+    if (acc.platform === 'ydpc') {
+      acc.vms = acc.vms || [];
+      const targetVm = acc.vms.find(v => String(v.userServiceId) === vmKey);
+      if (targetVm) {
+        targetVm[featureName] = finalValue;
+        updatedTarget = targetVm;
+      }
+    } else {
+      acc.desktops = acc.desktops || [];
+      const targetDesktop = acc.desktops.find(d => String(d.desktopId || d.objId) === vmKey);
+      if (targetDesktop) {
+        targetDesktop[featureName] = finalValue;
+        updatedTarget = targetDesktop;
+      }
+    }
+
+    saveConfig(appConfig);
+    const client = getClient(acc);
+    if (acc.platform === 'ydpc' && client && client.account) {
+      client.account.vms = acc.vms;
+    } else if (client && client.account) {
+      client.account.desktops = acc.desktops;
+    }
+
+    // 若当前正在执行该主机的挂机任务且用户关闭了任务/保活，立即安全释放当前长连接
+    if ((featureName === 'taskEnabled' || featureName === 'keepaliveEnabled') && finalValue === false && client && client.isTaskHanging) {
+      if (String(client.metrics?.desktopId) === String(vmKey)) {
+        if (client.endCurrentSession) {
+          client.endCurrentSession('User Disabled Task on Active Desktop');
+        }
+      }
+    }
+
+    let featureCn = '单机属性';
+    if (featureName === 'keepaliveEnabled') featureCn = '独立保活';
+    else if (featureName === 'taskEnabled') featureCn = '自动化任务';
+    else if (featureName === 'autoBootEnabled') featureCn = '自动开机';
+    else if (featureName === 'keepaliveInterval') featureCn = `独立保活周期 (${finalValue ? Math.round(finalValue/60) + '分钟' : '继承账号默认'})`;
+
+    appendLog('System', `[${acc.name}] 已将云主机 [${vmKey}] 的【${featureCn}】更新为: ${finalValue ? (typeof finalValue === 'boolean' ? '开启' : finalValue + '秒') : '关闭/继承'}`, 'info');
+    jsonResponse(res, { success: true, target: updatedTarget, account: acc });
     return;
   }
 

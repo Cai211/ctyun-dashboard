@@ -881,6 +881,153 @@ input:checked + .slider:before {
   transform: translateY(-1px);
 }
 
+/* 微型单机独立控制胶囊开关 (Pill Toggle Button & VM Row) */
+.vm-device-item {
+  display: flex;
+  flex-direction: column;
+  background: #ffffff;
+  border: 1px solid #e2e8f0;
+  border-radius: 6px;
+  padding: 8px 10px;
+  font-size: 12px;
+  gap: 6px;
+  transition: all 0.2s ease;
+}
+
+.vm-device-item:hover {
+  border-color: #cbd5e1;
+  box-shadow: 0 1px 3px rgba(0,0,0,0.05);
+}
+
+.vm-device-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+}
+
+.vm-device-footer {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 6px;
+  padding-top: 5px;
+  border-top: 1px dashed #f1f5f9;
+  flex-wrap: wrap;
+}
+
+.pill-btn-group {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  flex-wrap: wrap;
+}
+
+.pill-toggle-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  padding: 2px 7px;
+  border-radius: 9999px;
+  font-size: 10.5px;
+  font-weight: 600;
+  cursor: pointer;
+  border: 1px solid #e2e8f0;
+  background: #f8fafc;
+  color: #64748b;
+  user-select: none;
+  transition: all 0.15s ease;
+  line-height: 1.35;
+}
+
+.pill-toggle-btn:hover {
+  transform: translateY(-1px);
+  filter: brightness(0.96);
+}
+
+.pill-toggle-btn:active {
+  transform: scale(0.96);
+}
+
+.pill-toggle-btn.pill-on-keepalive {
+  background: #ecfdf5;
+  color: #059669;
+  border-color: #a7f3d0;
+}
+
+.pill-toggle-btn.pill-off-keepalive {
+  background: #f8fafc;
+  color: #94a3b8;
+  border-color: #e2e8f0;
+}
+
+.pill-toggle-btn.pill-on-autoboot {
+  background: #eff6ff;
+  color: #2563eb;
+  border-color: #bfdbfe;
+}
+
+.pill-toggle-btn.pill-off-autoboot {
+  background: #f8fafc;
+  color: #94a3b8;
+  border-color: #e2e8f0;
+}
+
+.pill-toggle-btn.pill-on-task {
+  background: #faf5ff;
+  color: #7c3aed;
+  border-color: #ddd6fe;
+}
+
+.pill-toggle-btn.pill-off-task {
+  background: #f8fafc;
+  color: #94a3b8;
+  border-color: #e2e8f0;
+}
+
+.pill-toggle-btn.pill-paused {
+  background: #fefce8;
+  color: #ca8a04;
+  border-color: #fef08a;
+}
+
+.pill-select {
+  display: inline-flex;
+  align-items: center;
+  padding: 1.5px 6px;
+  border-radius: 9999px;
+  font-size: 10.5px;
+  font-weight: 600;
+  cursor: pointer;
+  border: 1px solid #e2e8f0;
+  background: #f8fafc;
+  color: #475569;
+  outline: none;
+  line-height: 1.35;
+  transition: all 0.15s ease;
+}
+
+.pill-select:hover {
+  border-color: #cbd5e1;
+  background: #ffffff;
+}
+
+.pill-select:focus {
+  border-color: #3b82f6;
+  box-shadow: 0 0 0 2px rgba(59, 130, 246, 0.15);
+}
+
+.pill-toggle-btn.pill-action-boot {
+  background: #f0fdf4;
+  color: #166534;
+  border-color: #bbf7d0;
+  cursor: pointer;
+}
+.pill-toggle-btn.pill-action-boot:hover {
+  background: #dcfce7;
+  border-color: #86efac;
+}
+
 /* 现代化控制台日志面板 (macOS Window Style) */
 .log-panel {
   background: #ffffff;

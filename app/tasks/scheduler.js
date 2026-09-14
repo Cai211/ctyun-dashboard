@@ -441,7 +441,8 @@ class TaskScheduler {
           const vms = acc.vms || client.metrics?.vms || [];
           for (const vm of vms) {
             if (vm.keepaliveEnabled !== false) {
-              if (acc.features?.autoBoot && vm.vmStatus === '已关机') {
+              const isAutoBoot = acc.features?.autoBoot !== false && vm.autoBootEnabled !== false;
+              if (isAutoBoot && (vm.vmStatus === '已关机' || String(vm.vmStatus || '').includes('关机') || vm.vmStatusCode === 23 || vm.vmStatusCode === 16)) {
                 this.appendLog('SOHO', `[${acc.name}][${vm.vmName}] 检测到已关机，下发【自动开机守护】...`, 'warning', acc.name, 'ydpc');
                 if (client.bootVm) await client.bootVm(vm.userServiceId).catch(() => {});
               }

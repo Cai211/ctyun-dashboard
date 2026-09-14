@@ -461,6 +461,27 @@ function buildOfficialTasksHtml(m) {
   return `<div style="font-size: 12px; color: var(--text-muted); text-align: center; padding: 6px 0;">正在同步天翼云官方任务中心数据...</div>`;
 }
 
+// 计算单账号多机周期的综合概览展示文本
+function buildIntervalOverviewText(acc) {
+  const isYdpc = acc.platform === 'ydpc';
+  const defaultIntervalSec = parseInt(acc.keepaliveInterval || acc.pulseIntervalSeconds) || (isYdpc ? 600 : 30);
+  const items = isYdpc ? (acc.vms || []) : (acc.desktops || []);
+  
+  if (items.length > 1) {
+    const customItems = items.filter(it => it.keepaliveInterval && parseInt(it.keepaliveInterval) !== defaultIntervalSec);
+    if (customItems.length > 0) {
+      const parts = items.map(it => {
+        const sec = parseInt(it.keepaliveInterval) || defaultIntervalSec;
+        const rawName = String(it.vmName || it.desktopName || '主机');
+        const shortName = rawName.slice(0, 3);
+        return `${shortName} ${isYdpc ? Math.round(sec / 60) + '分' : sec + 's'}`;
+      });
+      return `多机独立 (${parts.join(' · ')})`;
+    }
+  }
+  return isYdpc ? `${Math.round(defaultIntervalSec / 60)} 分钟` : `${defaultIntervalSec}s`;
+}
+
 // 构造单个账号卡片 DOM 节点
 function buildAccountCardElement(acc, slotIndex) {
   const card = document.createElement("div");
@@ -500,13 +521,33 @@ function buildAccountCardElement(acc, slotIndex) {
     const vms = acc.vms || m.vms || [];
     const vmsCountText = vms.length > 0 ? `名下云主机 (${vms.length}台)` : '云主机';
 
+    const isAllYdpcChannelsOff = f.cagKeepAlive === false && f.mqttKeepAlive === false && f.sohoHeartbeat === false;
+    const isGlobalKeepAliveOff = f.keepAlive === false || isAllYdpcChannelsOff;
+    const isGlobalBootOff = f.autoBoot === false;
+
+    let ydpcMultiStatusBadge = '';
+    if (isGlobalKeepAliveOff) {
+      ydpcMultiStatusBadge = `<span style="color: #94a3b8; font-weight: 600;">⚪ 全局保活已关闭</span>`;
+    } else {
+      const anyKeepOn = vms.some(v => v.keepaliveEnabled !== false);
+      const allKeepOn = vms.every(v => v.keepaliveEnabled !== false);
+      if (allKeepOn && vms.length > 1) {
+        ydpcMultiStatusBadge = `<span style="color: #10b981; font-weight: 600;">🟢 全量多机保活已激活</span>`;
+      } else if (anyKeepOn) {
+        ydpcMultiStatusBadge = `<span style="color: #0284c7; font-weight: 600;">🟡 按单机策略保活中</span>`;
+      } else {
+        ydpcMultiStatusBadge = `<span style="color: #94a3b8; font-weight: 600;">⚪ 单机保活已全关</span>`;
+      }
+    }
+
     let vmsHtml = '';
     if (vms.length > 0) {
+
       vmsHtml = `
         <div style="background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 8px; padding: 10px 12px;">
           <div style="font-size: 12px; font-weight: 700; color: #334155; margin-bottom: 6px; display: flex; justify-content: space-between;">
             <span>🖥️ ${vmsCountText}</span>
-            <span style="color: #64748b; font-weight: normal;">自动识别限时/永久</span>
+            <span id="acc-multi-status-${acc.id}">${ydpcMultiStatusBadge}</span>
           </div>
           <div style="display: flex; flex-direction: column; gap: 6px;">
             ${vms.map(vm => {
@@ -515,15 +556,55 @@ function buildAccountCardElement(acc, slotIndex) {
               const cpuClean = vm.cpu ? String(vm.cpu).replace(/核+$/g, '') : '';
               const memClean = vm.memory ? String(vm.memory).replace(/[Gg]+$/g, '') : '';
               const specSuffix = (cpuClean && memClean) ? ` · ${cpuClean}核/${memClean}G` : (cpuClean ? ` · ${cpuClean}核` : (memClean ? ` · ${memClean}G` : ''));
+              const isKeepaliveOn = vm.keepaliveEnabled !== false;
+              const isAutoBootOn = vm.autoBootEnabled !== false;
+              const usid = String(vm.userServiceId || '');
+
+              let keepClass = isKeepaliveOn ? 'pill-on-keepalive' : 'pill-off-keepalive';
+              let keepText = isKeepaliveOn ? '开' : '关';
+              if (isGlobalKeepAliveOff && isKeepaliveOn) {
+                keepClass = 'pill-paused';
+                keepText = '待命(总关)';
+              }
+
+              let bootClass = isAutoBootOn ? 'pill-on-autoboot' : 'pill-off-autoboot';
+              let bootText = isAutoBootOn ? '开' : '关';
+              if (isGlobalBootOff && isAutoBootOn) {
+                bootClass = 'pill-paused';
+                bootText = '待命(总关)';
+              }
+
               return `
-                <div style="display: flex; justify-content: space-between; align-items: center; background: #ffffff; border: 1px solid #e2e8f0; border-radius: 6px; padding: 7px 10px; font-size: 12px; gap: 8px;">
-                  <div style="display: flex; flex-direction: column; min-width: 0; flex: 1;">
-                    <span style="color: #0f172a; font-weight: 700; text-overflow: ellipsis; overflow: hidden; white-space: nowrap;">${escapeHtml(vm.vmName || '移动云电脑')}</span>
-                    <span style="font-size: 11px; color: #64748b;">USID: ${vm.userServiceId}${specSuffix}</span>
+                <div class="vm-device-item" id="vm-item-${acc.id}-${usid}">
+                  <div class="vm-device-header">
+                    <div style="display: flex; flex-direction: column; min-width: 0; flex: 1;">
+                      <div style="display: flex; align-items: center; gap: 6px; overflow: hidden; white-space: nowrap;">
+                        <span style="color: #0f172a; font-weight: 700; text-overflow: ellipsis; overflow: hidden; white-space: nowrap;">${escapeHtml(vm.vmName || '移动云电脑')}</span>
+                        ${vm.vendorName ? `<span class="badge" style="background:#f0fdf4;color:#166534;border:1px solid #bbf7d0;font-size:9.5px;padding:0 5px;line-height:1.3;">${escapeHtml(vm.vendorName)}</span>` : ''}
+                      </div>
+                      <span style="font-size: 11px; color: #64748b;">USID: ${usid}${specSuffix}</span>
+                    </div>
+                    <div style="display: flex; align-items: center; gap: 6px; flex-shrink: 0;">
+                      <span class="badge ${isRunning ? 'badge-online' : 'badge-offline'}">${isRunning ? '运行中' : '已关机'}</span>
+                      <span style="font-size: 11.5px; font-weight: 600; color: ${vm.durationMode === 'limited' ? '#b45309' : '#059669'};">${vm.remainText || '♾️ 永久'}</span>
+                    </div>
                   </div>
-                  <div style="display: flex; align-items: center; gap: 6px; flex-shrink: 0;">
-                    <span class="badge ${isRunning ? 'badge-online' : 'badge-offline'}">${isRunning ? '运行中' : '已关机'}</span>
-                    <span style="font-size: 11.5px; font-weight: 600; color: ${vm.durationMode === 'limited' ? '#b45309' : '#059669'};">${vm.remainText || '♾️ 永久'}</span>
+                  <div class="vm-device-footer">
+                    <div class="pill-btn-group">
+                      <button type="button" class="pill-toggle-btn ${keepClass}" id="pill-keep-${acc.id}-${usid}" onclick="toggleVmFeature('${acc.id}', '${usid}', 'keepaliveEnabled', ${!isKeepaliveOn})" title="单台云电脑独立保活开关">⚡保活: ${keepText}</button>
+                      <button type="button" class="pill-toggle-btn ${bootClass}" id="pill-boot-${acc.id}-${usid}" onclick="toggleVmFeature('${acc.id}', '${usid}', 'autoBootEnabled', ${!isAutoBootOn})" title="单台云电脑自动开机守护开关">🛡️守护: ${bootText}</button>
+                      <select class="pill-select" id="pill-interval-${acc.id}-${usid}" onchange="changeVmInterval('${acc.id}', '${usid}', this.value)" title="单台云电脑独立保活周期设置">
+                        <option value="" ${!vm.keepaliveInterval ? 'selected' : ''}>⏱️继承默认</option>
+                        <option value="300" ${vm.keepaliveInterval == 300 ? 'selected' : ''}>⏱️5分钟</option>
+                        <option value="600" ${vm.keepaliveInterval == 600 ? 'selected' : ''}>⏱️10分钟</option>
+                        <option value="900" ${vm.keepaliveInterval == 900 ? 'selected' : ''}>⏱️15分钟</option>
+                        <option value="1800" ${vm.keepaliveInterval == 1800 ? 'selected' : ''}>⏱️30分钟</option>
+                        <option value="3600" ${vm.keepaliveInterval == 3600 ? 'selected' : ''}>⏱️60分钟</option>
+                      </select>
+                    </div>
+                    <div style="display: flex; gap: 4px; align-items: center;">
+                      ${!isRunning ? `<button type="button" class="pill-toggle-btn pill-action-boot" onclick="bootYdpcVm('${acc.id}', '${usid}')" title="单独对该台移动云电脑下发开机指令">🖥️ 开机</button>` : ''}
+                    </div>
                   </div>
                 </div>
               `;
@@ -576,7 +657,7 @@ function buildAccountCardElement(acc, slotIndex) {
             <span style="flex-shrink: 0; font-size: 11.5px; color: #64748b;">当前动作:</span>
             <span id="acc-hb-text-${acc.id}" title="${escapeHtml(m.lastHeartbeatResult || '保活巡检待命')}" style="color: #0284c7; font-weight: 600; text-overflow: ellipsis; overflow: hidden; white-space: nowrap; flex: 1; min-width: 0; cursor: help;">${escapeHtml(m.lastHeartbeatResult || '保活巡检待命')}</span>
           </div>
-          <div id="acc-active-info-${acc.id}" style="font-size: 11.5px; color: #475569; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">上次活跃: <span style="color: #0f172a; font-weight: 600;">${m.lastHeartbeatTime || acc.stats?.lastKeepAliveTime || '刚刚'}</span> · 周期: <b>${Math.round((acc.keepaliveInterval || 600) / 60)} 分钟</b></div>
+          <div id="acc-active-info-${acc.id}" style="font-size: 11.5px; color: #475569; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">上次活跃: <span style="color: #0f172a; font-weight: 600;">${m.lastHeartbeatTime || acc.stats?.lastKeepAliveTime || '刚刚'}</span> · 周期: <b>${buildIntervalOverviewText(acc)}</b></div>
         </div>
       </div>
 
@@ -598,6 +679,13 @@ function buildAccountCardElement(acc, slotIndex) {
             <span>🔄 ZTEC CAG TCP 三阶段握手保活</span>
             <label class="switch">
               <input type="checkbox" ${f.cagKeepAlive !== false ? 'checked' : ''} onchange="toggleFeature('${acc.id}', 'cagKeepAlive', this.checked)">
+              <span class="slider"></span>
+            </label>
+          </div>
+          <div class="feature-row">
+            <span>📡 官方 MQTT 3.1.1 链路长连保活</span>
+            <label class="switch">
+              <input type="checkbox" ${f.mqttKeepAlive !== false ? 'checked' : ''} onchange="toggleFeature('${acc.id}', 'mqttKeepAlive', this.checked)">
               <span class="slider"></span>
             </label>
           </div>
@@ -648,12 +736,30 @@ function buildAccountCardElement(acc, slotIndex) {
     flavorName: '标准版'
   }];
 
+  let ctyunMultiStatusBadge = '';
+  if (f.keepAlive === false) {
+    ctyunMultiStatusBadge = `<span style="color: #94a3b8; font-weight: 600;">⚪ 全局保活已关闭</span>`;
+  } else {
+    const anyKeepOn = dList.some(d => d.keepaliveEnabled !== false);
+    const allKeepOn = dList.every(d => d.keepaliveEnabled !== false);
+    if (allKeepOn && dList.length > 1) {
+      ctyunMultiStatusBadge = `<span style="color: #10b981; font-weight: 600;">🟢 全量多机保活已激活</span>`;
+    } else if (anyKeepOn) {
+      ctyunMultiStatusBadge = `<span style="color: #0284c7; font-weight: 600;">🟡 按单机策略保活中</span>`;
+    } else {
+      ctyunMultiStatusBadge = `<span style="color: #94a3b8; font-weight: 600;">⚪ 单机保活已全关</span>`;
+    }
+  }
+
   if (dList.length > 0) {
+    const isGlobalKeepAliveOff = f.keepAlive === false;
+    const isGlobalTasksOff = f.cloudHang === false && f.autoSign === false && f.aiChat === false;
+
     desktopsHtml = `
       <div style="background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 8px; padding: 10px 12px; margin-bottom: 8px;">
         <div style="font-size: 12px; font-weight: 700; color: #334155; margin-bottom: 6px; display: flex; justify-content: space-between;">
           <span>🖥️ 名下云电脑 (${dList.length}台)</span>
-          <span style="color: ${dList.length > 1 ? '#10b981' : '#64748b'}; font-weight: 600;">${dList.length > 1 ? '🟢 全量多机保活已激活' : '多设备独立支持'}</span>
+          <span id="acc-multi-status-${acc.id}">${ctyunMultiStatusBadge}</span>
         </div>
           <div style="display: flex; flex-direction: column; gap: 6px;">
             ${dList.map(d => {
@@ -688,18 +794,55 @@ function buildAccountCardElement(acc, slotIndex) {
                 memClean = memClean || m2[2];
               }
               const specSuffix = ` · ${cpuClean}核/${memClean}G`;
+              const isKeepaliveOn = d.keepaliveEnabled !== false;
+              const isTaskOn = d.taskEnabled !== false;
+              const targetId = String(d.desktopId || d.objId || idText);
+
+              let keepClass = isKeepaliveOn ? 'pill-on-keepalive' : 'pill-off-keepalive';
+              let keepText = isKeepaliveOn ? '开' : '关';
+              if (isGlobalKeepAliveOff && isKeepaliveOn) {
+                keepClass = 'pill-paused';
+                keepText = '待命(总关)';
+              }
+
+              let taskClass = isTaskOn ? 'pill-on-task' : 'pill-off-task';
+              let taskText = isTaskOn ? '开' : '关';
+              if (isGlobalTasksOff && isTaskOn) {
+                taskClass = 'pill-paused';
+                taskText = '待命(总关)';
+              }
+
               return `
-                <div style="display: flex; justify-content: space-between; align-items: center; background: #ffffff; border: 1px solid #e2e8f0; border-radius: 6px; padding: 6px 10px; font-size: 12px; gap: 8px;">
-                  <div style="display: flex; flex-direction: column; min-width: 0; flex: 1; overflow: hidden;">
-                    <div style="display: flex; align-items: center; gap: 6px; overflow: hidden; white-space: nowrap;">
-                      <span title="${escapeHtml(d.desktopName || '云电脑')}" style="color: #0f172a; font-weight: 700; text-overflow: ellipsis; overflow: hidden; white-space: nowrap; cursor: help;">${escapeHtml(d.desktopName || '云电脑')}</span>
-                      ${d.flavorName ? `<span style="font-size: 10.5px; background: #eff6ff; color: #2563eb; padding: 1px 6px; border-radius: 4px; flex-shrink: 0; white-space: nowrap;">${escapeHtml(d.flavorName)}</span>` : ''}
+                <div class="vm-device-item" id="desktop-item-${acc.id}-${targetId}">
+                  <div class="vm-device-header">
+                    <div style="display: flex; flex-direction: column; min-width: 0; flex: 1; overflow: hidden;">
+                      <div style="display: flex; align-items: center; gap: 6px; overflow: hidden; white-space: nowrap;">
+                        <span title="${escapeHtml(d.desktopName || '天翼云电脑')}" style="color: #0f172a; font-weight: 700; text-overflow: ellipsis; overflow: hidden; white-space: nowrap; cursor: help;">${escapeHtml(d.desktopName || '天翼云电脑')}</span>
+                        ${d.flavorName ? `<span style="font-size: 10.5px; background: #eff6ff; color: #2563eb; padding: 1px 6px; border-radius: 4px; flex-shrink: 0; white-space: nowrap;">${escapeHtml(d.flavorName)}</span>` : ''}
+                      </div>
+                      <span style="font-size: 11px; color: #64748b; margin-top: 1px; text-overflow: ellipsis; overflow: hidden; white-space: nowrap;" title="设备ID: ${escapeHtml(idText)}${escapeHtml(specSuffix)}">ID: ${escapeHtml(idText)}${escapeHtml(specSuffix)}</span>
                     </div>
-                    <span style="font-size: 11px; color: #64748b; margin-top: 1px; text-overflow: ellipsis; overflow: hidden; white-space: nowrap;" title="设备ID: ${escapeHtml(idText)}${escapeHtml(specSuffix)}">ID: ${escapeHtml(idText)}${escapeHtml(specSuffix)}</span>
+                    <div style="display: flex; align-items: center; gap: 6px; flex-shrink: 0; white-space: nowrap;">
+                      <span class="badge ${isRunning ? 'badge-online' : 'badge-offline'}">${isRunning ? '运行中' : '已关机'}</span>
+                      <button class="btn btn-sm btn-primary" style="padding: 2px 7px; font-size: 11px; flex-shrink: 0; white-space: nowrap;" onclick="launchWebDesktop('${acc.id}', '${d.desktopId || d.objId}')">🚀 打开</button>
+                    </div>
                   </div>
-                  <div style="display: flex; align-items: center; gap: 6px; flex-shrink: 0; white-space: nowrap;">
-                    <span class="badge ${isRunning ? 'badge-online' : 'badge-offline'}">${isRunning ? '运行中' : '已关机'}</span>
-                    <button class="btn btn-sm btn-primary" style="padding: 2px 7px; font-size: 11px; flex-shrink: 0; white-space: nowrap;" onclick="launchWebDesktop('${acc.id}', '${d.desktopId}')">🚀 打开</button>
+                  <div class="vm-device-footer">
+                    <div class="pill-btn-group">
+                      <button type="button" class="pill-toggle-btn ${keepClass}" id="pill-keep-${acc.id}-${targetId}" onclick="toggleVmFeature('${acc.id}', '${targetId}', 'keepaliveEnabled', ${!isKeepaliveOn})" title="单台云电脑独立保活开关 (脉冲长连保活)">⚡保活: ${keepText}</button>
+                      <button type="button" class="pill-toggle-btn ${taskClass}" id="pill-task-${acc.id}-${targetId}" onclick="toggleVmFeature('${acc.id}', '${targetId}', 'taskEnabled', ${!isTaskOn})" title="单台云电脑独立任务开关 (控制打卡/AI对话/1小时挂机任务)">🎯任务: ${taskText}</button>
+                      <select class="pill-select" id="pill-interval-${acc.id}-${targetId}" onchange="changeVmInterval('${acc.id}', '${targetId}', this.value)" title="单台云电脑独立脉冲周期设置">
+                        <option value="" ${!d.keepaliveInterval ? 'selected' : ''}>⏱️继承默认</option>
+                        <option value="15" ${d.keepaliveInterval == 15 ? 'selected' : ''}>⏱️15s脉冲</option>
+                        <option value="30" ${d.keepaliveInterval == 30 ? 'selected' : ''}>⏱️30s脉冲</option>
+                        <option value="60" ${d.keepaliveInterval == 60 ? 'selected' : ''}>⏱️1分钟脉冲</option>
+                        <option value="120" ${d.keepaliveInterval == 120 ? 'selected' : ''}>⏱️2分钟脉冲</option>
+                        <option value="300" ${d.keepaliveInterval == 300 ? 'selected' : ''}>⏱️5分钟脉冲</option>
+                      </select>
+                    </div>
+                    <div style="display: flex; gap: 4px; align-items: center;">
+                      ${!isRunning ? `<button type="button" class="pill-toggle-btn pill-action-boot" onclick="bootCtyunVm('${acc.id}', '${targetId}')" title="单独对此台天翼云电脑下发开机">🖥️ 开机</button>` : ''}
+                    </div>
                   </div>
                 </div>
               `;
@@ -746,7 +889,7 @@ function buildAccountCardElement(acc, slotIndex) {
     <div style="background: var(--bg-card); border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; font-size: 12px;">
       <div style="display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 6px; gap: 6px; flex-wrap: wrap;">
         <span style="color: #2563eb; font-weight: 700; flex-shrink: 0;">📡 状态与心跳监视</span>
-        <span id="acc-countdown-${acc.id}" style="color: var(--text-muted); font-size: 11px; text-align: right; flex-shrink: 1;">${m.isTaskHanging ? `模式: <b style="color:#d97706;">定时挂机中</b> (剩余: <b style="color:#2563eb;">${m.cycleCountdown || 0}s</b>)` : `脉冲间隔: <b>${acc.pulseIntervalSeconds || 30}s</b> (倒计时: <b style="color:#16a34a;">${m.cycleCountdown || 30}s</b>)`}</span>
+        <span id="acc-countdown-${acc.id}" style="color: var(--text-muted); font-size: 11px; text-align: right; flex-shrink: 1;">${m.isTaskHanging ? `模式: <b style="color:#d97706;">定时挂机中</b> (剩余: <b style="color:#2563eb;">${m.cycleCountdown || 0}s</b>)` : `脉冲周期: <b>${buildIntervalOverviewText(acc)}</b> (倒计时: <b style="color:#16a34a;">${m.cycleCountdown || 30}s</b>)`}</span>
       </div>
       <div style="color: #475569; line-height: 1.7; display: flex; flex-direction: column; gap: 3px;">
         <div style="display: flex; align-items: baseline; gap: 4px; overflow: hidden; white-space: nowrap; min-width: 0;">
@@ -757,7 +900,7 @@ function buildAccountCardElement(acc, slotIndex) {
           <span style="flex-shrink: 0; font-size: 11.5px; color: #64748b;">当前动作:</span>
           <span id="acc-hb-text-${acc.id}" title="${escapeHtml(m.lastHeartbeatResult || '正在建立心跳通道...')}" style="color: ${(m.lastHeartbeatResult || '').includes('避让') ? '#d97706' : '#16a34a'}; font-weight: 600; text-overflow: ellipsis; overflow: hidden; white-space: nowrap; flex: 1; min-width: 0; cursor: help;">${escapeHtml(m.lastHeartbeatResult || '正在建立心跳通道...')}</span>
         </div>
-        <div style="font-size: 11.5px; color: #475569;">成功轮次: <span id="acc-success-count-${acc.id}" style="color: #2563eb; font-weight: 600;">${m.successCount || 0} 轮</span></div>
+        <div style="font-size: 11.5px; color: #475569;">当日成功轮次: <span id="acc-success-count-${acc.id}" style="color: #2563eb; font-weight: 600;">${m.successCount || 0} 轮</span></div>
       </div>
     </div>
 
@@ -871,7 +1014,7 @@ function updateAccountsInPlace(filteredAccounts) {
     if (cdEl) {
       cdEl.innerHTML = m.isTaskHanging
         ? `模式: <b style="color:#d97706;">定时挂机中</b> (剩余: <b style="color:#2563eb;">${m.cycleCountdown || 0}s</b>)`
-        : `脉冲间隔: <b>${acc.pulseIntervalSeconds || 30}s</b> (脉冲倒计时: <b style="color:#16a34a;">${m.cycleCountdown || 30}s</b>)`;
+        : `脉冲周期: <b>${buildIntervalOverviewText(acc)}</b> (倒计时: <b style="color:#16a34a;">${m.cycleCountdown || 30}s</b>)`;
     }
 
     const successEl = document.getElementById(`acc-success-count-${acc.id}`);
@@ -879,10 +1022,10 @@ function updateAccountsInPlace(filteredAccounts) {
       successEl.innerText = `${m.successCount || 0} 轮`;
     }
 
-    // 4. 更新移动云上次活跃时间
+    // 4. 更新移动云上次活跃时间与周期概览
     const activeInfoEl = document.getElementById(`acc-active-info-${acc.id}`);
     if (activeInfoEl) {
-      activeInfoEl.innerHTML = `上次活跃: <span style="color: #0f172a; font-weight: 600;">${m.lastHeartbeatTime || acc.stats?.lastKeepAliveTime || '刚刚'}</span> · 周期: <b>${Math.round((acc.keepaliveInterval || 600) / 60)} 分钟</b>`;
+      activeInfoEl.innerHTML = `上次活跃: <span style="color: #0f172a; font-weight: 600;">${m.lastHeartbeatTime || acc.stats?.lastKeepAliveTime || '刚刚'}</span> · 周期: <b>${buildIntervalOverviewText(acc)}</b>`;
     }
 
     // 5. 更新官方任务积分与列表 (天翼云)
@@ -894,6 +1037,113 @@ function updateAccountsInPlace(filteredAccounts) {
     const tasksListEl = document.getElementById(`acc-tasks-list-${acc.id}`);
     if (tasksListEl && m.officialTasks && m.officialTasks.length > 0) {
       tasksListEl.innerHTML = buildOfficialTasksHtml(m);
+    }
+
+    // 6. 原地增量更新单机独立保活与开机/任务胶囊开关状态与总状态徽章
+    const multiStatusEl = document.getElementById(`acc-multi-status-${acc.id}`);
+    if (isYdpc && acc.vms) {
+      const isAllYdpcChannelsOff = f.cagKeepAlive === false && f.mqttKeepAlive === false && f.sohoHeartbeat === false;
+      const isGlobalKeepAliveOff = f.keepAlive === false || isAllYdpcChannelsOff;
+      const isGlobalBootOff = f.autoBoot === false;
+
+      if (multiStatusEl) {
+        if (isGlobalKeepAliveOff) {
+          multiStatusEl.innerHTML = `<span style="color: #94a3b8; font-weight: 600;">⚪ 全局保活已关闭</span>`;
+        } else {
+          const anyKeepOn = acc.vms.some(v => v.keepaliveEnabled !== false);
+          const allKeepOn = acc.vms.every(v => v.keepaliveEnabled !== false);
+          if (allKeepOn && acc.vms.length > 1) {
+            multiStatusEl.innerHTML = `<span style="color: #10b981; font-weight: 600;">🟢 全量多机保活已激活</span>`;
+          } else if (anyKeepOn) {
+            multiStatusEl.innerHTML = `<span style="color: #0284c7; font-weight: 600;">🟡 按单机策略保活中</span>`;
+          } else {
+            multiStatusEl.innerHTML = `<span style="color: #94a3b8; font-weight: 600;">⚪ 单机保活已全关</span>`;
+          }
+        }
+      }
+
+      acc.vms.forEach(vm => {
+        const usid = String(vm.userServiceId || '');
+        const isKeepaliveOn = vm.keepaliveEnabled !== false;
+        const isAutoBootOn = vm.autoBootEnabled !== false;
+        const pKeep = document.getElementById(`pill-keep-${acc.id}-${usid}`);
+        if (pKeep) {
+          let keepClass = isKeepaliveOn ? 'pill-on-keepalive' : 'pill-off-keepalive';
+          let keepText = isKeepaliveOn ? '开' : '关';
+          if (isGlobalKeepAliveOff && isKeepaliveOn) {
+            keepClass = 'pill-paused';
+            keepText = '待命(总关)';
+          }
+          pKeep.className = `pill-toggle-btn ${keepClass}`;
+          pKeep.innerText = `⚡保活: ${keepText}`;
+        }
+        const pBoot = document.getElementById(`pill-boot-${acc.id}-${usid}`);
+        if (pBoot) {
+          let bootClass = isAutoBootOn ? 'pill-on-autoboot' : 'pill-off-autoboot';
+          let bootText = isAutoBootOn ? '开' : '关';
+          if (isGlobalBootOff && isAutoBootOn) {
+            bootClass = 'pill-paused';
+            bootText = '待命(总关)';
+          }
+          pBoot.className = `pill-toggle-btn ${bootClass}`;
+          pBoot.innerText = `🛡️守护: ${bootText}`;
+        }
+        const pInterval = document.getElementById(`pill-interval-${acc.id}-${usid}`);
+        if (pInterval && document.activeElement !== pInterval) {
+          pInterval.value = vm.keepaliveInterval ? String(vm.keepaliveInterval) : '';
+        }
+      });
+    } else if (!isYdpc && acc.desktops) {
+      const isGlobalKeepAliveOff = f.keepAlive === false;
+      const isGlobalTasksOff = f.cloudHang === false && f.autoSign === false && f.aiChat === false;
+
+      if (multiStatusEl) {
+        if (isGlobalKeepAliveOff) {
+          multiStatusEl.innerHTML = `<span style="color: #94a3b8; font-weight: 600;">⚪ 全局保活已关闭</span>`;
+        } else {
+          const anyKeepOn = acc.desktops.some(d => d.keepaliveEnabled !== false);
+          const allKeepOn = acc.desktops.every(d => d.keepaliveEnabled !== false);
+          if (allKeepOn && acc.desktops.length > 1) {
+            multiStatusEl.innerHTML = `<span style="color: #10b981; font-weight: 600;">🟢 全量多机保活已激活</span>`;
+          } else if (anyKeepOn) {
+            multiStatusEl.innerHTML = `<span style="color: #0284c7; font-weight: 600;">🟡 按单机策略保活中</span>`;
+          } else {
+            multiStatusEl.innerHTML = `<span style="color: #94a3b8; font-weight: 600;">⚪ 单机保活已全关</span>`;
+          }
+        }
+      }
+
+      acc.desktops.forEach(d => {
+        const targetId = String(d.desktopId || d.objId || d.desktopCode || '');
+        const isKeepaliveOn = d.keepaliveEnabled !== false;
+        const isTaskOn = d.taskEnabled !== false;
+        const pKeep = document.getElementById(`pill-keep-${acc.id}-${targetId}`);
+        if (pKeep) {
+          let keepClass = isKeepaliveOn ? 'pill-on-keepalive' : 'pill-off-keepalive';
+          let keepText = isKeepaliveOn ? '开' : '关';
+          if (isGlobalKeepAliveOff && isKeepaliveOn) {
+            keepClass = 'pill-paused';
+            keepText = '待命(总关)';
+          }
+          pKeep.className = `pill-toggle-btn ${keepClass}`;
+          pKeep.innerText = `⚡保活: ${keepText}`;
+        }
+        const pTask = document.getElementById(`pill-task-${acc.id}-${targetId}`);
+        if (pTask) {
+          let taskClass = isTaskOn ? 'pill-on-task' : 'pill-off-task';
+          let taskText = isTaskOn ? '开' : '关';
+          if (isGlobalTasksOff && isTaskOn) {
+            taskClass = 'pill-paused';
+            taskText = '待命(总关)';
+          }
+          pTask.className = `pill-toggle-btn ${taskClass}`;
+          pTask.innerText = `🎯任务: ${taskText}`;
+        }
+        const pInterval = document.getElementById(`pill-interval-${acc.id}-${targetId}`);
+        if (pInterval && document.activeElement !== pInterval) {
+          pInterval.value = d.keepaliveInterval ? String(d.keepaliveInterval) : '';
+        }
+      });
     }
   });
 }
@@ -1229,6 +1479,9 @@ async function toggleFeature(accId, featureKey, checked) {
   acc.features = acc.features || {};
   acc.features[featureKey] = checked;
 
+  // 立即刷新卡片视图以联动反映单机与全局层叠状态
+  renderAccounts();
+
   try {
     const res = await authFetch(`/api/accounts/${accId}`, {
       method: "PUT",
@@ -1247,6 +1500,129 @@ async function toggleFeature(accId, featureKey, checked) {
     showToast("网络请求异常: " + e.message, "error");
     acc.features[featureKey] = !checked;
     renderAccounts();
+  }
+}
+
+// 单台云电脑独立特性开关切换 (优化为原地乐观更新与异步上报)
+async function toggleVmFeature(accId, vmKey, featureName, nextVal) {
+  const acc = accounts.find(a => a.id === accId);
+  if (!acc) return;
+
+  const isYdpc = acc.platform === 'ydpc';
+  if (isYdpc) {
+    acc.vms = acc.vms || [];
+    const targetVm = acc.vms.find(v => String(v.userServiceId) === String(vmKey));
+    if (targetVm) targetVm[featureName] = nextVal;
+  } else {
+    acc.desktops = acc.desktops || [];
+    const targetD = acc.desktops.find(d => String(d.desktopId || d.objId) === String(vmKey));
+    if (targetD) targetD[featureName] = nextVal;
+  }
+
+  // 1. 立即乐观更新 DOM 按钮状态
+  let prefixKey = 'pill-boot-';
+  if (featureName === 'keepaliveEnabled') prefixKey = 'pill-keep-';
+  else if (featureName === 'taskEnabled') prefixKey = 'pill-task-';
+
+  const pillId = prefixKey + accId + '-' + vmKey;
+  const pillBtn = document.getElementById(pillId);
+  if (pillBtn) {
+    let onClass = 'pill-on-autoboot';
+    let offClass = 'pill-off-autoboot';
+    let labelPrefix = '🛡️守护: ';
+    if (featureName === 'keepaliveEnabled') {
+      onClass = 'pill-on-keepalive';
+      offClass = 'pill-off-keepalive';
+      labelPrefix = '⚡保活: ';
+    } else if (featureName === 'taskEnabled') {
+      onClass = 'pill-on-task';
+      offClass = 'pill-off-task';
+      labelPrefix = '🎯任务: ';
+    }
+
+    pillBtn.classList.remove(onClass, offClass);
+    pillBtn.classList.add(nextVal ? onClass : offClass);
+    pillBtn.innerText = labelPrefix + (nextVal ? '开' : '关');
+    pillBtn.onclick = () => toggleVmFeature(accId, vmKey, featureName, !nextVal);
+  }
+
+  const featureCn = featureName === 'keepaliveEnabled' ? '单机独立保活' : (featureName === 'taskEnabled' ? '单机自动化任务' : '单机自动开机守护');
+  try {
+    const res = await authFetch(`/api/accounts/${accId}/vm-feature`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ vmId: vmKey, desktopId: vmKey, feature: featureName, value: nextVal })
+    });
+    if (res.ok) {
+      showToast(`已${nextVal ? '开启' : '关闭'}${featureCn}`, "success");
+    } else {
+      const data = await res.json();
+      showToast(data.error || "更新失败", "error");
+      await loadAccounts(true);
+    }
+  } catch (e) {
+    showToast("网络请求异常: " + e.message, "error");
+    await loadAccounts(true);
+  }
+}
+
+// 单台云电脑独立保活周期调整
+async function changeVmInterval(accId, vmKey, value) {
+  const acc = accounts.find(a => a.id === accId);
+  if (!acc) return;
+
+  const numVal = parseInt(value);
+  const finalVal = (!isNaN(numVal) && numVal > 0) ? numVal : null;
+
+  const isYdpc = acc.platform === 'ydpc';
+  if (isYdpc) {
+    acc.vms = acc.vms || [];
+    const targetVm = acc.vms.find(v => String(v.userServiceId) === String(vmKey));
+    if (targetVm) targetVm.keepaliveInterval = finalVal;
+  } else {
+    acc.desktops = acc.desktops || [];
+    const targetD = acc.desktops.find(d => String(d.desktopId || d.objId) === String(vmKey));
+    if (targetD) targetD.keepaliveInterval = finalVal;
+  }
+
+  // 立即刷新卡片以联动反映多机周期概览
+  renderAccounts();
+
+  try {
+    const res = await authFetch(`/api/accounts/${accId}/vm-feature`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ vmId: vmKey, desktopId: vmKey, feature: 'keepaliveInterval', value: finalVal })
+    });
+    if (res.ok) {
+      showToast(`已将该主机保活周期调整为: ${finalVal ? (isYdpc ? Math.round(finalVal / 60) + '分钟' : finalVal + '秒') : '继承账号默认'}`, "success");
+    } else {
+      const data = await res.json();
+      showToast(data.error || "更新失败", "error");
+      await loadAccounts(true);
+    }
+  } catch (e) {
+    showToast("网络请求异常: " + e.message, "error");
+    await loadAccounts(true);
+  }
+}
+
+// 单台天翼云电脑快捷开机
+async function bootCtyunVm(accId, desktopId) {
+  showToast("正在向天翼云下发开机指令...", "info");
+  try {
+    const res = await authFetch(`/api/accounts/${accId}/power/poweron?desktopId=${encodeURIComponent(desktopId)}`, {
+      method: "POST"
+    });
+    const data = await res.json();
+    if (res.ok) {
+      showToast(data.msg || "🎉 开机指令下发成功，云电脑正在启动中！", "success");
+      setTimeout(() => loadAccounts(true), 3000);
+    } else {
+      showToast(data.error || "开机指令下发失败", "error");
+    }
+  } catch (e) {
+    showToast("网络异常: " + e.message, "error");
   }
 }
 
@@ -1489,6 +1865,15 @@ async function saveYdpcAccount() {
     // 编辑修改模式
     showToast("正在保存移动云账号修改并重新同步...", "info");
     try {
+      const existingAcc = accounts.find(a => a.id === accId) || {};
+      const features = {
+        autoBoot,
+        cagKeepAlive: existingAcc.features?.cagKeepAlive !== false,
+        mqttKeepAlive: existingAcc.features?.mqttKeepAlive !== false,
+        sohoHeartbeat: existingAcc.features?.sohoHeartbeat !== false,
+        keepAlive: existingAcc.features?.keepAlive !== false
+      };
+
       const res = await authFetch(`/api/accounts/${accId}`, {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
@@ -1498,7 +1883,7 @@ async function saveYdpcAccount() {
           password,
           accountType,
           keepaliveInterval,
-          features: { autoBoot, cagKeepAlive: true, sohoHeartbeat: true, keepAlive: true }
+          features
         })
       });
       const data = await res.json();
@@ -2471,12 +2856,6 @@ async function openSettingsModal() {
     if (document.getElementById("cron-redeem")) document.getElementById("cron-redeem").value = c.redeemCron || "";
     toggleSubCronInputs(enableSub);
 
-    if (document.getElementById("set-keepalive-sec")) {
-      document.getElementById("set-keepalive-sec").value = settings.keepAliveSeconds || 60;
-    }
-    if (document.getElementById("set-pulse-sec")) {
-      document.getElementById("set-pulse-sec").value = settings.pulseIntervalSeconds || 30;
-    }
     if (document.getElementById("set-allow-reg")) {
       document.getElementById("set-allow-reg").checked = settings.allowRegistration === true;
     }
@@ -2507,8 +2886,8 @@ async function saveSettings() {
   const payload = {
     systemTitle: customTitle || "天翼云/移动云电脑保活签到中心",
     systemSubtitle: customSubtitle || "多账号长连接保活守护 · 多运营商支持 · 每日签到打卡 · 智能挂机",
-    keepAliveSeconds: parseInt(document.getElementById("set-keepalive-sec") ? document.getElementById("set-keepalive-sec").value : 60) || 60,
-    pulseIntervalSeconds: Math.min(3300, Math.max(10, parseInt(document.getElementById("set-pulse-sec") ? document.getElementById("set-pulse-sec").value : 30) || 30)),
+    keepAliveSeconds: 60,
+    pulseIntervalSeconds: 30,
     allowRegistration: document.getElementById("set-allow-reg") ? document.getElementById("set-allow-reg").checked : false,
     defaultQuota: document.getElementById("set-default-quota") ? parseInt(document.getElementById("set-default-quota").value) || 2 : 2,
     cron: {

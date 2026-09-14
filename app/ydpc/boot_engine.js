@@ -78,15 +78,15 @@ async function scGetToken(authData) {
 }
 
 /**
- * SC 家庭云电脑开机: OAuth → getConnectInfo → getVmReadyStatus
+ * SC 家庭云电脑开机: OAuth → getConnectInfo → getVmReadyStatus 渐进式就绪轮询 (最高等待 120s)
  */
-async function scBootVm(authData) {
+async function scBootVm(authData, maxWaitSeconds = 120) {
   const vmId = String(authData.vmId);
   const accessToken = await scGetToken(authData);
   const encryptedVmId = scRsaEncryptVmId(vmId);
   const agent = new https.Agent({ rejectUnauthorized: false });
 
-  // 1. getConnectInfo (触发开机)
+  // 1. getConnectInfo (触发底层开机)
   const ciRes = await fetch(`${SC_BASE_URL}/sc/open-portal/openapi/terminal/v1/getConnectInfo`, {
     method: 'POST',
     headers: scHeaders(accessToken),
@@ -99,21 +99,28 @@ async function scBootVm(authData) {
     throw new Error(`getConnectInfo: ${ci.message || ci.code}`);
   }
 
-  // 2. getVmReadyStatus
+  // 2. 渐进式轮询 getVmReadyStatus (每 4 秒轮询一次，最高 120 秒，容纳冷启动慢机器)
   const traceId = ci.data?.traceId || '';
   if (traceId) {
-    const readyRes = await fetch(`${SC_BASE_URL}/sc/open-portal/openapi/terminal/v1/getVmReadyStatus`, {
-      method: 'POST',
-      headers: scHeaders(accessToken),
-      body: JSON.stringify({ vmId: encryptedVmId, traceId }),
-      agent
-    });
-    const rs = await readyRes.json();
-    const ready = rs.data?.readyStatus;
-    if (ready === 1) {
-      return { success: true, message: '🎉 SC家庭云电脑开机成功 (ready=1)！' };
+    const startTime = Date.now();
+    while (Date.now() - startTime < maxWaitSeconds * 1000) {
+      try {
+        const readyRes = await fetch(`${SC_BASE_URL}/sc/open-portal/openapi/terminal/v1/getVmReadyStatus`, {
+          method: 'POST',
+          headers: scHeaders(accessToken),
+          body: JSON.stringify({ vmId: encryptedVmId, traceId }),
+          agent
+        });
+        const rs = await readyRes.json();
+        const ready = rs.data?.readyStatus;
+        if (ready === 1) {
+          return { success: true, message: '🎉 SC家庭云电脑开机成功并就绪 (ready=1)！' };
+        }
+      } catch (e) {}
+
+      await new Promise(r => setTimeout(r, 4000));
     }
-    return { success: true, message: `SC开机指令已下发 (状态: ${ready || '启动中'})` };
+    return { success: true, message: 'SC开机指令已下达，云端正在启动中...' };
   }
 
   return { success: true, message: 'SC云电脑开机已触发！' };

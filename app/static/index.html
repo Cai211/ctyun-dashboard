@@ -543,18 +543,6 @@
           </div>
         </details>
 
-        <h4 style="font-size: 14px; margin-top: 14px; color: var(--accent);">📡 保活与连接参数</h4>
-        <div class="form-group">
-          <label>保活强制重连周期 (秒)</label>
-          <input type="number" class="form-control" id="set-keepalive-sec" value="60" min="10">
-          <div class="form-text">【挂机模式生效】每日 1 小时任务未达标时，长连接保持该时长后强制重连刷新会话 (建议默认 60 秒)。</div>
-        </div>
-        <div class="form-group">
-          <label>脉冲保活间隔 (秒)</label>
-          <input type="number" class="form-control" id="set-pulse-sec" value="30" min="10" max="3300">
-          <div class="form-text">【旁观者脉冲】每隔该秒数进行一次短暂的旁观连接 (不认领会话、永不影响官方客户端)，持续重置云端 1 小时休眠计时器。范围 10~3300 秒，默认 30 秒。</div>
-        </div>
-
         <h4 style="font-size: 14px; margin-top: 14px; color: var(--accent);">🏷️ 平台与品牌个性化</h4>
         <div class="form-group">
           <label>控制台主标题名称</label>
@@ -838,7 +826,7 @@
       <div>云电脑可视化全功能多账号管理平台 · 纯协议超轻量架构</div>
       <div style="margin-top: 6px;" id="footer-version-container">
         <span id="footer-version-badge" style="color: var(--text-muted); cursor: default;">
-          📌 当前版本: v2.1.1
+          📌 当前版本: v2.2
         </span>
       </div>
     </footer>
@@ -848,15 +836,30 @@
   <div class="modal-backdrop hidden" id="release-notes-modal">
     <div class="modal" style="max-width: 650px; max-height: 85vh; display: flex; flex-direction: column;">
       <div class="modal-header">
-        <h3>🚀 版本更新说明 (v2.1.1)</h3>
+        <h3>🚀 版本更新说明 (v2.2)</h3>
         <button class="modal-close" onclick="closeModal('release-notes-modal')">&times;</button>
       </div>
       <div class="modal-body" style="font-size: 13px; line-height: 1.7; color: #334155; overflow-y: auto; max-height: calc(85vh - 120px); display: flex; flex-direction: column; gap: 16px;">
         
-        <!-- v2.1.1 -->
+        <!-- v2.2 -->
         <div style="background: #eff6ff; border: 1px solid #bfdbfe; border-radius: 8px; padding: 12px 16px;">
           <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; border-bottom: 1px solid #dbeafe; padding-bottom: 6px;">
-            <div style="font-weight: 700; color: #1d4ed8; font-size: 14.5px;">✨ v2.1.1 重点特性与优化 (最新)</div>
+            <div style="font-weight: 700; color: #1d4ed8; font-size: 14.5px;">✨ v2.2 重点特性与架构重构 (最新)</div>
+            <div style="color: #64748b; font-size: 12px;">发布时间：2026-09-14</div>
+          </div>
+          <ul style="padding-left: 18px; display: flex; flex-direction: column; gap: 6px; margin: 0;">
+            <li><b>🖥️ 单账号多主机精细化独立纳管（Per-VM Governance）</b>：彻底打破账号级“一刀切”控制模式，支持对名下每台云主机进行独立控制。天翼云支持单机独立「⚡保活」与「🎯任务」调度；移动云支持单机独立「⚡保活」与「🛡️守护」，彻底消除限时机（如 20h 套餐）被误开机消耗时长的痛点。</li>
+            <li><b>⏱️ 高精度单机独立时间戳时间轮调度（Per-Device Timestamp Wheel）</b>：单账号名下各台云主机支持配置不同的专属保活/脉冲周期（如主力机 5 分钟高频保活、备用机 30 分钟静默守护）；双云底层看门狗升级为高精度时间戳差量调度器，各主机时钟独立运转，彻底解决全局统一休眠覆盖单机周期的问题。</li>
+            <li><b>🔗 全链路层叠状态感知与动态即时联动</b>：卡片顶部多机状态与主机微胶囊开关全面与全局总开关联动，总开关关闭或通道全关时，单机微胶囊即时呈现琥珀色「待命(总关)」状态；移动云保活通道支持全链路熔断感知。</li>
+            <li><b>📈 当日成功轮次统计与系统设置精简</b>：「成功轮次」全面升级为「当日成功轮次」，支持北京时间每日 0 点自然日自动归零与服务重启防丢持久化；精简系统设置面板中冗余的保活/脉冲输入，实现卡片内行内单机即时自选与热重载。</li>
+            <li><b>🛡️ 差量合并引擎（Diff-Merge）防覆盖</b>：云端官方接口轮询刷新时以主机唯一 ID 主键合并，严格持久化保留本地用户的独立开关与周期配置，刷新不覆盖。</li>
+          </ul>
+        </div>
+
+        <!-- v2.1.1 -->
+        <div style="background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 8px; padding: 12px 16px;">
+          <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; border-bottom: 1px solid #e2e8f0; padding-bottom: 6px;">
+            <div style="font-weight: 700; color: #0f172a; font-size: 14px;">✨ v2.1.1 重点特性与优化</div>
             <div style="color: #64748b; font-size: 12px;">发布时间：2026-09-12</div>
           </div>
           <ul style="padding-left: 18px; display: flex; flex-direction: column; gap: 6px; margin: 0;">

@@ -379,6 +379,77 @@ class SohoClient {
     return await this.fetchApi('/cc/cloudPc/heartbeat/v2', { userServiceId: Number(userServiceId) });
   }
 
+  /**
+   * 获取官方 MQTT 长连接 Broker 认证凭据
+   * 调用 /system/mqttConnect/v1 获取 host, port, clientId, userName, password, topic 等
+   */
+  async getMqttConnectInfo() {
+    return await this.fetchApi('/system/mqttConnect/v1', {});
+  }
+
+  /**
+   * 官方活跃度与业务行为埋点上报 (对齐 point.soho.komect.com 规范)
+   */
+  async pointEvent(eventName = 'heartbeat', extraData = {}) {
+    try {
+      if (!this.publicKeyPem) {
+        await this.bootstrapPublicKey();
+      }
+
+      const clientTime = new Date().toLocaleString('sv-SE', { timeZone: 'Asia/Shanghai' });
+      const payloadData = {
+        clientTime,
+        phone: this.savedUsername || '',
+        Account: this.savedUsername || '',
+        Account_type: this.accountType === 'sub' ? 'Sub_account' : 'Main_account',
+        ...extraData
+      };
+
+      const bodyObj = {
+        eventName,
+        data: JSON.stringify(payloadData)
+      };
+
+      const plain = Buffer.from(JSON.stringify(bodyObj), 'utf8');
+      const bodyPayload = rsaEncryptBody(this.publicKeyPem, plain);
+      const sendBody = JSON.stringify({ data: bodyPayload });
+
+      const path = '/custom/cc/v1';
+      const headers = {
+        'X-SOHO-AppKey': APP_KEY,
+        'X-SOHO-AppType': this.appType,
+        'X-SOHO-ClientVersion': VERSION,
+        'X-SOHO-DeviceId': this.deviceId,
+        'X-SOHO-RomVersion': this.romVersion,
+        'X-SOHO-SohoToken': this.sohoToken || '',
+        'X-SOHO-Timestamp': nowMs(),
+        'X-SOHO-UserId': this.userId || '',
+        'X-SOHO-Uuid': genUuid(),
+        'X-SOHO-VersionNum': VERSION_NUM,
+        'Content-Type': 'application/json',
+        'User-Agent': this.userAgent
+      };
+
+      headers['X-SOHO-Signature'] = buildSign('POST', path, headers, bodyPayload);
+
+      const outgoingHeaders = {};
+      for (const [k, v] of Object.entries(headers)) {
+        if (v !== '') outgoingHeaders[k] = v;
+      }
+
+      const pointUrl = `https://point.soho.komect.com/point${path}`;
+      const res = await fetch(pointUrl, {
+        method: 'POST',
+        headers: outgoingHeaders,
+        body: sendBody
+      });
+      const json = await res.json().catch(() => ({}));
+      return json;
+    } catch (e) {
+      return { code: -1, msg: e.message };
+    }
+  }
+
   async bootVm(userServiceId) {
     // 官方 SOHO 开机/激活接口
     try {

@@ -1,6 +1,7 @@
 const { SohoClient } = require('./soho_client');
 const { performCagAuthHold } = require('./cag_client');
 const { bootYdpcVmUnified } = require('./boot_engine');
+const { MqttKeepAliveClient } = require('./mqtt_client');
 
 function getBeijingTimeString() {
   const d = new Date();
@@ -48,6 +49,7 @@ class YdpcClient {
 
     this.workerRunning = false;
     this.loopTimer = null;
+    this.mqttClient = null;
   }
 
   async login() {
@@ -70,6 +72,52 @@ class YdpcClient {
         await this.login();
       }
       const vms = await this.sohoClient.listCloudPcs();
+
+      // 自动嗅探识别每台主机的底层架构底座 (深信服 SCG vs 中兴 ZTE)
+      for (const vm of vms) {
+        if (!vm.vendor) {
+          try {
+            const auth = await this.sohoClient.getFirmAuth(vm.userServiceId);
+            if (auth) {
+              if (auth.scAuthCode && !auth.cagIp) {
+                vm.vendor = 'SCG';
+                vm.vendorName = '深信服 SCG';
+              } else if (auth.cagIp || auth.vmUserName || auth.vmcIp) {
+                vm.vendor = 'ZTE';
+                vm.vendorName = '中兴 ZTE';
+              }
+            }
+          } catch (e) {
+            // 优雅降级：依据 SPU/SKU/名称特征自适应判定
+            const rawText = `${vm.vmName} ${vm.skuName} ${vm.spuCode}`;
+            if (/深信服|家庭|SCG/i.test(rawText)) {
+              vm.vendor = 'SCG';
+              vm.vendorName = '深信服 SCG';
+            } else {
+              vm.vendor = 'ZTE';
+              vm.vendorName = '中兴 ZTE';
+            }
+          }
+        }
+      }
+
+      // 差量合并引擎 (Diff-Merge)：严格保留本地已有的单机独立保活、独立周期与开机偏好设置
+      const oldVmsMap = new Map((this.account.vms || []).map(v => [String(v.userServiceId), v]));
+      for (const vm of vms) {
+        const old = oldVmsMap.get(String(vm.userServiceId));
+        if (old) {
+          if (old.keepaliveEnabled !== undefined) vm.keepaliveEnabled = old.keepaliveEnabled;
+          if (old.autoBootEnabled !== undefined) vm.autoBootEnabled = old.autoBootEnabled;
+          if (old.keepaliveInterval !== undefined) vm.keepaliveInterval = old.keepaliveInterval;
+          if (old.lastKeepAliveAt !== undefined) vm.lastKeepAliveAt = old.lastKeepAliveAt;
+          if (old._durationExhausted !== undefined) vm._durationExhausted = old._durationExhausted;
+          if (old._bootRestricted !== undefined) vm._bootRestricted = old._bootRestricted;
+        } else {
+          if (vm.keepaliveEnabled === undefined) vm.keepaliveEnabled = true;
+          if (vm.autoBootEnabled === undefined) vm.autoBootEnabled = true;
+        }
+      }
+
       this.account.vms = vms;
       this.metrics.vms = vms;
 
@@ -101,6 +149,56 @@ class YdpcClient {
     }
   }
 
+  async ensureMqttConnection() {
+    const accName = this.account.name || this.account.user;
+    if (this.account.features?.mqttKeepAlive === false) {
+      if (this.mqttClient) {
+        this.mqttClient.disconnect();
+        this.mqttClient = null;
+      }
+      return;
+    }
+
+    if (this.mqttClient && this.mqttClient.isConnected) {
+      return;
+    }
+
+    try {
+      if (!this.sohoClient.sohoToken) {
+        await this.login();
+      }
+      const res = await this.sohoClient.getMqttConnectInfo();
+      if (res && res.code === 2000 && res.data) {
+        const info = res.data;
+        const host = info.host || 'alive.soho.komect.com';
+        const port = Number(info.port) || 443;
+        const clientId = info.clientId || `cl_${this.account.user.slice(-4)}_${Date.now().toString(36)}`;
+        const username = info.userName || info.username || '';
+        const password = info.password || '';
+        const keepAliveSeconds = Number(info.keepAlive) || 60;
+
+        if (this.mqttClient) {
+          this.mqttClient.disconnect();
+        }
+
+        this.mqttClient = new MqttKeepAliveClient({
+          host,
+          port,
+          clientId,
+          username,
+          password,
+          keepAliveSeconds,
+          onLog: (src, msg, lvl) => this.appendLog(src, `[${accName}] ${msg}`, lvl, accName, 'ydpc')
+        });
+
+        await this.mqttClient.connect(10000);
+        this.appendLog('MQTT', `[${accName}] 🟢 官方 MQTT 3.1.1 over TLS 链路已连接保持 (Broker: ${host})`, 'success', accName, 'ydpc');
+      }
+    } catch (err) {
+      this.appendLog('MQTT', `[${accName}] MQTT 链路连接异常: ${err.message}`, 'warning', accName, 'ydpc');
+    }
+  }
+
   async sendHeartbeat(userServiceId) {
     const accName = this.account.name || this.account.user;
     const usid = userServiceId || this.account.vms?.[0]?.userServiceId;
@@ -120,6 +218,10 @@ class YdpcClient {
         await this.login();
       }
       const res = await this.sohoClient.heartbeat(usid);
+      
+      // 触发官方活跃度埋点上报 (对齐 point.soho.komect.com)
+      this.sohoClient.pointEvent('heartbeat', { userServiceId: Number(usid) }).catch(() => {});
+
       const nowStr = getBeijingTimeOnly();
       this.metrics.status = 'online';
       if (this.account.stats) this.account.stats.keepAliveStatus = 'online';
@@ -239,15 +341,34 @@ class YdpcClient {
     this.workerRunning = true;
     const accName = this.account.name || this.account.user;
 
-    const intervalSec = Math.max(300, parseInt(this.account.keepaliveInterval) || 600); // 默认 10 分钟一次
-    this.appendLog('CAG', `[${accName}] 移动云电脑持久保活守护看门狗已启动 (周期: ${Math.round(intervalSec / 60)} 分钟)...`, 'info', accName, 'ydpc');
+    const defaultIntervalSec = Math.max(60, parseInt(this.account.keepaliveInterval) || 600);
+    this.appendLog('CAG', `[${accName}] 移动云电脑多机独立时间戳看门狗已启动 (基准周期: ${Math.round(defaultIntervalSec / 60)} 分钟)...`, 'info', accName, 'ydpc');
+
+    // 守护看门狗以 20 秒为基准时间片高精度巡检各单机
+    const TICK_INTERVAL_MS = 20000;
 
     const runCycle = async () => {
       if (!this.workerRunning) return;
       try {
-        await this.refreshVms();
-        const vms = this.account.vms || [];
+        const isAllChannelsOff = this.account.features?.cagKeepAlive === false && 
+                                 this.account.features?.mqttKeepAlive === false && 
+                                 this.account.features?.sohoHeartbeat === false;
+        if (this.account.features?.keepAlive === false || isAllChannelsOff) {
+          this.metrics.status = 'offline';
+          this.metrics.lastHeartbeatResult = '自动化保活通道已全部关闭 (待命中)';
+          if (this.workerRunning) {
+            this.loopTimer = setTimeout(runCycle, TICK_INTERVAL_MS);
+          }
+          return;
+        }
 
+        // 定期静默刷新 VM 状态 (每 60 秒一次)
+        if (!this._lastVmsRefreshAt || Date.now() - this._lastVmsRefreshAt > 60000) {
+          await this.refreshVms().catch(() => {});
+          this._lastVmsRefreshAt = Date.now();
+        }
+
+        const vms = this.account.vms || [];
         const anyRunning = vms.some(v => String(v.vmStatus || '').includes('运行') || v.vmStatusCode === 1);
         if (!anyRunning) {
           this.metrics.status = 'offline';
@@ -255,78 +376,100 @@ class YdpcClient {
           this.metrics.lastHeartbeatResult = '云电脑处于已关机状态，自动守护待命中';
         }
 
+        const now = Date.now();
         for (const vm of vms) {
-          if (vm.keepaliveEnabled !== false) {
-            const isVmOff = String(vm.vmStatus || '').includes('关机') || vm.vmStatusCode === 23 || vm.vmStatusCode === 16;
-            
-            // 1. 判断是否为独立子账号 (子账号无权通过 API 自主开机，必须避免循环重试)
-            const isSubAccount = this.account.accountType === 'sub';
+          if (vm.keepaliveEnabled === false) continue;
 
-            // 2. 判断是否为限时套餐且时长已耗尽 (如 20小时到期/剩余0小时/负数/月包用尽/CAG报错时长已用完)
-            const isLimitedExpired = vm._durationExhausted || (
-              vm.durationMode === 'limited' && (
-                vm.remainHours <= 0 || 
-                (typeof vm.remainDurationTime === 'number' && vm.remainDurationTime <= 0) ||
-                String(vm.remainText || '').includes('0小时') ||
-                String(vm.remainText || '').includes('已耗尽') ||
-                String(vm.remainText || '').includes('用完')
-              )
-            ) || (
-              (String(vm.skuName || '').includes('20小时') || String(vm.vmName || '').includes('20小时') || String(vm.skuName || '').includes('月包')) &&
-              (vm.remainHours <= 0 || (typeof vm.remainDurationTime === 'number' && vm.remainDurationTime <= 0) || String(vm.remainText || '').includes('0小时') || String(vm.remainText || '').includes('已耗尽') || String(vm.remainText || '').includes('用完'))
-            );
+          // 核心：单机独立时间戳差量调度 (Per-Device Interval Wheel)
+          const vmIntervalSec = Math.max(60, parseInt(vm.keepaliveInterval) || defaultIntervalSec);
+          const lastActive = vm.lastKeepAliveAt || 0;
+          const elapsedSec = Math.floor((now - lastActive) / 1000);
 
-            // 3. 自动开机守护逻辑 (加入全量熔断与状态抑制)
-            if (this.account.features?.autoBoot && isVmOff) {
-              if (isLimitedExpired) {
-                if (!vm._hasWarnedExpired) {
-                  this.appendLog('SOHO', `[${accName}][${vm.vmName}] 检测到机器已关机，由于限时套餐时长已耗尽 (${vm.remainText || '0小时'})，已智能跳过自动开机守护`, 'info', accName, 'ydpc');
-                  vm._hasWarnedExpired = true;
-                }
-              } else if (isSubAccount || vm._bootRestricted) {
-                if (!vm._hasWarnedSub) {
-                  this.appendLog('SOHO', `[${accName}][${vm.vmName}] 检测到机器已关机，独立子账号受平台权限限制无法接口拉起，已进入被动守护待命模式`, 'info', accName, 'ydpc');
-                  vm._hasWarnedSub = true;
-                }
-              } else {
-                this.appendLog('SOHO', `[${accName}][${vm.vmName}] 检测到机器已关机，触发【自动开机守护】拉起中...`, 'warning', accName, 'ydpc');
-                await this.bootVm(vm.userServiceId).catch(err => {
-                  this.appendLog('SOHO', `[${accName}][${vm.vmName}] 自动开机未成功: ${err.message}`, 'warning', accName, 'ydpc');
-                  if (err.message?.includes('子账号受限') || err.message?.includes('无权访问') || err.message?.includes('4141')) {
-                    vm._bootRestricted = true;
-                  }
-                });
+          // 时间未到达该主机的专属周期，继续休眠跳过
+          if (lastActive > 0 && elapsedSec < vmIntervalSec) {
+            continue;
+          }
+
+          const isVmOff = String(vm.vmStatus || '').includes('关机') || vm.vmStatusCode === 23 || vm.vmStatusCode === 16;
+          const isSubAccount = this.account.accountType === 'sub';
+
+          const isLimitedExpired = vm._durationExhausted || (
+            vm.durationMode === 'limited' && (
+              vm.remainHours <= 0 || 
+              (typeof vm.remainDurationTime === 'number' && vm.remainDurationTime <= 0) ||
+              String(vm.remainText || '').includes('0小时') ||
+              String(vm.remainText || '').includes('已耗尽') ||
+              String(vm.remainText || '').includes('用完')
+            )
+          ) || (
+            (String(vm.skuName || '').includes('20小时') || String(vm.vmName || '').includes('20小时') || String(vm.skuName || '').includes('月包')) &&
+            (vm.remainHours <= 0 || (typeof vm.remainDurationTime === 'number' && vm.remainDurationTime <= 0) || String(vm.remainText || '').includes('0小时') || String(vm.remainText || '').includes('已耗尽') || String(vm.remainText || '').includes('用完'))
+          );
+
+          // 1. 自动开机守护逻辑
+          const isAutoBootAllowed = this.account.features?.autoBoot !== false && vm.autoBootEnabled !== false;
+          if (isAutoBootAllowed && isVmOff) {
+            if (isLimitedExpired) {
+              if (!vm._hasWarnedExpired) {
+                this.appendLog('SOHO', `[${accName}][${vm.vmName}] 检测到机器已关机，由于限时套餐时长已耗尽 (${vm.remainText || '0小时'})，已智能跳过自动开机守护`, 'info', accName, 'ydpc');
+                vm._hasWarnedExpired = true;
               }
-            }
-
-            // 4. 发送 SOHO 心跳 (仅在机器开启且时长未耗尽时进行 SOHO 保活)
-            if (this.account.features?.sohoHeartbeat !== false && !isLimitedExpired && !isVmOff) {
-              await this.sendHeartbeat(vm.userServiceId).catch(() => {});
-            }
-
-            // 5. 执行 CAG TCP 握手保活 (仅在机器运行中且时长未耗尽时有效握手)
-            if (this.account.features?.cagKeepAlive !== false && !isVmOff && !isLimitedExpired) {
-              await this.pingCag(vm.userServiceId, 3).catch(e => {
-                const errMsg = e.message || '';
-                if (errMsg.includes('用完') || errMsg.includes('已用尽') || errMsg.includes('计费周期') || errMsg.includes('到期')) {
-                  vm._durationExhausted = true;
-                  vm.durationMode = 'limited';
-                  vm.remainText = '⏱️ 0小时';
-                  vm.remainHours = 0;
-                  this.metrics.remainText = '⏱️ 0小时';
-                  this.metrics.status = 'offline';
-                  this.metrics.lastHeartbeatResult = '当前计费周期时长已用完 (待命中)';
-                  if (!vm._hasWarnedExhausted) {
-                    this.appendLog('CAG', `[${accName}][${vm.vmName}] 当前计费周期时长已用完，保活守护已自动转为静默休眠待命模式`, 'info', accName, 'ydpc');
-                    vm._hasWarnedExhausted = true;
-                  }
-                } else {
-                  this.appendLog('CAG', `[${accName}][${vm.vmName}] CAG 握手异常: ${errMsg}`, 'warning', accName, 'ydpc');
+            } else if (isSubAccount || vm._bootRestricted) {
+              if (!vm._hasWarnedSub) {
+                this.appendLog('SOHO', `[${accName}][${vm.vmName}] 检测到机器已关机，独立子账号受平台权限限制无法接口拉起，已进入被动守护待命模式`, 'info', accName, 'ydpc');
+                vm._hasWarnedSub = true;
+              }
+            } else {
+              this.appendLog('SOHO', `[${accName}][${vm.vmName}] 检测到机器已关机，触发【自动开机守护】拉起中...`, 'warning', accName, 'ydpc');
+              await this.bootVm(vm.userServiceId).catch(err => {
+                this.appendLog('SOHO', `[${accName}][${vm.vmName}] 自动开机未成功: ${err.message}`, 'warning', accName, 'ydpc');
+                if (err.message?.includes('子账号受限') || err.message?.includes('无权访问') || err.message?.includes('4141')) {
+                  vm._bootRestricted = true;
                 }
               });
             }
           }
+
+          // 2. 发送 SOHO 心跳与埋点
+          if (this.account.features?.sohoHeartbeat !== false && !isLimitedExpired && !isVmOff) {
+            await this.sendHeartbeat(vm.userServiceId).catch(() => {});
+          }
+
+          // 3. 执行 CAG TCP 握手保活
+          if (this.account.features?.cagKeepAlive !== false && !isVmOff && !isLimitedExpired) {
+            await this.pingCag(vm.userServiceId, 3).then(() => {
+              this.appendLog('CAG', `[${accName}][${vm.vmName}] ZTEC CAG TCP 握手保活成功 (周期: ${Math.round(vmIntervalSec / 60)} 分钟)`, 'success', accName, 'ydpc');
+            }).catch(e => {
+              const errMsg = e.message || '';
+              if (errMsg.includes('用完') || errMsg.includes('已用尽') || errMsg.includes('计费周期') || errMsg.includes('到期')) {
+                vm._durationExhausted = true;
+                vm.durationMode = 'limited';
+                vm.remainText = '⏱️ 0小时';
+                vm.remainHours = 0;
+                this.metrics.remainText = '⏱️ 0小时';
+                this.metrics.status = 'offline';
+                this.metrics.lastHeartbeatResult = '当前计费周期时长已用完 (待命中)';
+                if (!vm._hasWarnedExhausted) {
+                  this.appendLog('CAG', `[${accName}][${vm.vmName}] 当前计费周期时长已用完，保活守护已自动转为静默休眠待命模式`, 'info', accName, 'ydpc');
+                  vm._hasWarnedExhausted = true;
+                }
+              } else {
+                this.appendLog('CAG', `[${accName}][${vm.vmName}] CAG 握手异常: ${errMsg}`, 'warning', accName, 'ydpc');
+              }
+            });
+          }
+
+          // 记录单机专属活跃时间戳并同步状态
+          vm.lastKeepAliveAt = now;
+          this.metrics.lastHeartbeatTime = getBeijingTimeString().slice(11);
+          if (this.account.stats) this.account.stats.lastKeepAliveTime = getBeijingTimeString();
         }
+
+        // 保持官方 MQTT 3.1.1 over TLS 链路
+        if (this.account.features?.mqttKeepAlive !== false) {
+          await this.ensureMqttConnection().catch(() => {});
+        }
+
       } catch (err) {
         this.metrics.status = 'offline';
         this.metrics.lastHeartbeatResult = `异常: ${err.message}`;
@@ -334,12 +477,12 @@ class YdpcClient {
       }
 
       if (this.workerRunning) {
-        this.loopTimer = setTimeout(runCycle, intervalSec * 1000);
+        this.loopTimer = setTimeout(runCycle, TICK_INTERVAL_MS);
       }
     };
 
-    // 延迟 3 秒立即执行第一次
-    setTimeout(runCycle, 3000);
+    // 延迟 2 秒立即执行首次
+    setTimeout(runCycle, 2000);
   }
 
   stopKeepAliveWorker() {
@@ -347,6 +490,10 @@ class YdpcClient {
     if (this.loopTimer) {
       clearTimeout(this.loopTimer);
       this.loopTimer = null;
+    }
+    if (this.mqttClient) {
+      this.mqttClient.disconnect();
+      this.mqttClient = null;
     }
     this.metrics.status = 'offline';
     if (this.account.stats) this.account.stats.keepAliveStatus = 'offline';
