@@ -746,7 +746,7 @@ function buildAccountCardElement(acc, slotIndex) {
     <div style="background: var(--bg-card); border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; font-size: 12px;">
       <div style="display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 6px; gap: 6px; flex-wrap: wrap;">
         <span style="color: #2563eb; font-weight: 700; flex-shrink: 0;">📡 状态与心跳监视</span>
-        <span id="acc-countdown-${acc.id}" style="color: var(--text-muted); font-size: 11px; text-align: right; flex-shrink: 1;">${f.cloudHang && !(m.officialTasks?.find(t => t.name.includes('使用1小时'))?.status === 2) ? `模式: <b style="color:#d97706;">持续挂机累加</b> (剩余: <b style="color:#2563eb;">${m.cycleCountdown || 0}s</b>)` : `脉冲间隔: <b>${acc.pulseIntervalSeconds || 30}s</b> (倒计时: <b style="color:#16a34a;">${m.cycleCountdown || 30}s</b>)`}</span>
+        <span id="acc-countdown-${acc.id}" style="color: var(--text-muted); font-size: 11px; text-align: right; flex-shrink: 1;">${m.isTaskHanging ? `模式: <b style="color:#d97706;">定时挂机中</b> (剩余: <b style="color:#2563eb;">${m.cycleCountdown || 0}s</b>)` : `脉冲间隔: <b>${acc.pulseIntervalSeconds || 30}s</b> (倒计时: <b style="color:#16a34a;">${m.cycleCountdown || 30}s</b>)`}</span>
       </div>
       <div style="color: #475569; line-height: 1.7; display: flex; flex-direction: column; gap: 3px;">
         <div style="display: flex; align-items: baseline; gap: 4px; overflow: hidden; white-space: nowrap; min-width: 0;">
@@ -869,8 +869,8 @@ function updateAccountsInPlace(filteredAccounts) {
     // 3. 更新倒计时与轮次 (天翼云)
     const cdEl = document.getElementById(`acc-countdown-${acc.id}`);
     if (cdEl) {
-      cdEl.innerHTML = f.cloudHang && !(m.officialTasks?.find(t => t.name.includes('使用1小时'))?.status === 2)
-        ? `模式: <b style="color:#d97706;">持续挂机累加</b> (剩余: <b style="color:#2563eb;">${m.cycleCountdown || 0}s</b>)`
+      cdEl.innerHTML = m.isTaskHanging
+        ? `模式: <b style="color:#d97706;">定时挂机中</b> (剩余: <b style="color:#2563eb;">${m.cycleCountdown || 0}s</b>)`
         : `脉冲间隔: <b>${acc.pulseIntervalSeconds || 30}s</b> (脉冲倒计时: <b style="color:#16a34a;">${m.cycleCountdown || 30}s</b>)`;
     }
 

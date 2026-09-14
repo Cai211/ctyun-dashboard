@@ -197,34 +197,23 @@ async function executeNativeSign(client, acc, onLog = console.log) {
 }
 
 /**
- * 云电脑挂机守护
+ * 云电脑定时挂机任务 (由 Scheduler Cron 精准调度或用户手动触发)
  */
 async function executeNativeHang(client, acc, onLog = console.log) {
-  onLog('Hang', `正在检查云电脑 WebSocket 长连接保活状态...`, 'info');
-  try {
-    // 确保后台长连接守护进程正在运行
-    if (!client.workerRunning && acc.features?.keepAlive !== false && !acc.manualShutdown) {
-      onLog('Hang', `正在启动云电脑长连接守护进程...`, 'info');
-      client.startKeepAliveWorker();
-    }
-    await client.refreshOfficialTasks();
-    const hangTask = client.metrics.officialTasks?.find(t => t.name.includes('使用1小时'));
-    const curSec = hangTask ? (hangTask.current || 0) : 0;
-    const totSec = hangTask ? (hangTask.total || 3600) : 3600;
-    const curMin = Math.floor(curSec / 60);
-    const totMin = Math.floor(totSec / 60);
-
-    if (curSec >= totSec || (hangTask && hangTask.status === 2)) {
-      onLog('Hang', `✅ 今日云电脑使用时长已达标 (${totMin}分钟)，已斩获 100 积分奖励！`, 'success');
-      return { success: true, isCompleted: true, message: `今日云电脑使用时长已满 ${totMin} 分钟，已斩获 100 积分！` };
-    } else {
-      onLog('Hang', `⚡ 当前挂机进度: ${curMin}/${totMin} 分钟 (${curSec}/${totSec}秒)。长连接正稳定运行累加中。`, 'info');
-      return { success: true, isCompleted: false, message: `当前挂机进度: ${curMin}/${totMin} 分钟，持续累加中` };
-    }
-  } catch (e) {
-    onLog('Hang', `挂机守护异常: ${e.message}`, 'error');
-    throw e;
+  if (acc.platform === 'ydpc') {
+    onLog('Hang', `[${acc.name}] 移动云电脑无需执行挂机时长任务。`, 'info');
+    return { success: true, isCompleted: true, message: '移动云无需挂机' };
   }
+
+  if (client && typeof client.runHangTask === 'function') {
+    return await client.runHangTask(onLog);
+  }
+
+  // 兜底直接拉取任务状态
+  await client.refreshOfficialTasks();
+  const hangTask = client.metrics.officialTasks?.find(t => t.name.includes('使用1小时'));
+  const isDone = hangTask && (hangTask.status === 2 || (hangTask.total > 0 && hangTask.current >= hangTask.total));
+  return { success: true, isCompleted: isDone, message: isDone ? '今日挂机时长已满 1 小时' : '挂机任务就绪' };
 }
 
 module.exports = {

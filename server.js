@@ -631,6 +631,7 @@ class CtYunClient {
     this.webUserActiveUntil = 0;
     this.externalYieldUntil = 0; // 官方客户端抢占避让截止时间戳
     this.lastTokenRenewAt = Date.now();
+    this.isTaskHanging = false; // 是否正在执行 Scheduler 精准调度的 1 小时挂机任务
   }
 
   // 检测今日挂机 1 小时任务是否已达成 (严格依据今日真实达成状态)
@@ -1798,6 +1799,85 @@ class CtYunClient {
     });
   }
 
+  /**
+   * 定时挂机 1 小时任务执行器 (由 Scheduler 定时精确触发，或由用户在控制台手动点击触发)
+   * 职责严格隔离：仅在定时触发时临时启动独占认领会话，挂满 1 小时后自动结束；
+   * 若挂机中途被用户客户端顶掉，立即主动避让 10 分钟，绝不反复重连争抢！
+   */
+  async runHangTask(onLog = console.log) {
+    const accName = this.account.name || this.account.user;
+
+    // 1. 检查今日挂机 1 小时是否已达成
+    await this.refreshOfficialTasks();
+    if (this.isTodayHangTaskCompleted()) {
+      onLog('Hang', `[${accName}] ✅ 今日云电脑 1 小时挂机任务已达成 (+100积分)，无需重复执行。`, 'success');
+      return { success: true, isCompleted: true, message: '今日挂机时长已满 60 分钟' };
+    }
+
+    // 2. 检查用户与客户端避让状态
+    if (this.isWebUserActive && Date.now() < this.webUserActiveUntil) {
+      onLog('Hang', `[${accName}] 浏览器用户正在操作云电脑，本次挂机任务主动避让。`, 'info');
+      return { success: true, isCompleted: false, message: '用户网页操作中，主动避让' };
+    }
+    if (Date.now() < this.externalYieldUntil) {
+      const waitMin = Math.ceil((this.externalYieldUntil - Date.now()) / 60000);
+      onLog('Hang', `[${accName}] 官方客户端 (App/PC) 近期正在使用，挂机任务处于避让冷却期 (剩余 ${waitMin} 分钟)，跳过本次抢占。`, 'info');
+      return { success: true, isCompleted: false, message: '处于客户端避让冷却期' };
+    }
+
+    // 3. 标记正在执行挂机任务，让后台脉冲循环主动让位
+    this.isTaskHanging = true;
+    this.metrics.isTaskHanging = true;
+    if (this.endCurrentSession) {
+      this.endCurrentSession('Yield to Scheduled Hang Task');
+    }
+
+    try {
+      // 4. 获取目标云电脑并确保开机
+      const desktops = await this.getDesktops();
+      if (!desktops || desktops.length === 0) {
+        onLog('Hang', `[${accName}] 账号名下暂无可用云电脑，无法执行挂机任务。`, 'warning');
+        return { success: false, isCompleted: false, message: '名下无云电脑' };
+      }
+
+      const mainDesktop = desktops[0];
+      const targetName = mainDesktop.objName || mainDesktop.desktopName || '云电脑';
+      const isRunning = mainDesktop && (mainDesktop.useStatusText === '运行中' || mainDesktop.useStatus == 25);
+
+      if (!isRunning) {
+        onLog('Hang', `[${accName}][${targetName}] 云电脑未开机，正在下发开机唤醒指令...`, 'info');
+        await this.controlPower(mainDesktop.objId || mainDesktop.desktopId, 'poweron').catch(() => {});
+        onLog('Hang', `[${accName}][${targetName}] 开机指令已下达，等待 25 秒启动就绪...`, 'info');
+        await new Promise(r => setTimeout(r, 25000));
+      }
+
+      onLog('Hang', `[${accName}][${targetName}] 🚀 定时挂机任务已启动，正在建立独占会话累加使用时长...`, 'info');
+
+      // 5. 执行独占挂机长连接 (最长 3600 秒)
+      const result = await this.runDesktopKeepAliveSession(mainDesktop, true, 3600);
+
+      // 6. 如果挂机过程中连接被断开 (被官方客户端顶掉或主动争抢)
+      if (result && (result.reason === 'occupied' || result.reason === 'Closed' || result.reason === 'Socket Error')) {
+        await this.refreshOfficialTasks();
+        if (!this.isTodayHangTaskCompleted()) {
+          this.yieldToExternalClient(10);
+          onLog('Hang', `[${accName}][${targetName}] ⚠️ 挂机连接被中断 (检测到官方客户端登录)，后台已主动让位避让 10 分钟，绝不反抢客户端！`, 'warning');
+        }
+      }
+
+      await this.refreshOfficialTasks();
+      const isDone = this.isTodayHangTaskCompleted();
+      return {
+        success: true,
+        isCompleted: isDone,
+        message: isDone ? '今日 1 小时挂机任务已圆满达成！' : '本次挂机阶段已结束'
+      };
+    } finally {
+      this.isTaskHanging = false;
+      this.metrics.isTaskHanging = false;
+    }
+  }
+
   async runCycleLoop() {
     const accName = this.account.name || this.account.user;
 
@@ -1814,6 +1894,12 @@ class CtYunClient {
           this.metrics.lastHeartbeatResult = '⚠️ 登录会话已过期，请在卡片点击【重新验证】输入验证码！';
           if (this.account.stats) this.account.stats.keepAliveStatus = 'offline';
           await new Promise(r => setTimeout(r, 15000));
+          continue;
+        }
+
+        // 如果 Scheduler 正在执行独占挂机任务，常态保活循环主动避让等待
+        if (this.isTaskHanging) {
+          await new Promise(r => setTimeout(r, 5000));
           continue;
         }
 
@@ -1868,73 +1954,45 @@ class CtYunClient {
           continue;
         }
 
-        // 3. 运行中云电脑保活
+        // 3. 运行中云电脑常态保活 (100% 纯旁观者脉冲防休眠，永不独占认领会话，绝不影响/争抢官方客户端)
         this.bootWaitStartTime = null;
-        const isCloudHangEnabled = this.account.features?.cloudHang === true;
-        const todayHangDone = this.isTodayHangTaskCompleted();
-        const isHangMode = isCloudHangEnabled && !todayHangDone;
-
         this.metrics.status = 'online';
         if (this.account.stats) this.account.stats.keepAliveStatus = 'online';
 
-        // 挂机模式 (isHangMode)：优先在第一台主机器累加 1 小时时长，同时对名下其余运行中的机器执行脉冲保活
-        if (isHangMode) {
-          const mainDesktop = desktops[0];
-          this.metrics.desktopId = mainDesktop.objId || mainDesktop.desktopId;
-          this.metrics.desktopName = mainDesktop.objName || mainDesktop.desktopName || '云电脑';
+        // 脉冲防休眠模式：依次为名下每一台运行中的云电脑执行脉冲握手保活 (各保持 15~20 秒)
+        const pulseConnectSec = Math.min(60, Math.max(15, appConfig.settings?.keepAliveSeconds || 20));
 
-          // 对其余机器先发送短暂脉冲保活防休眠
-          for (let i = 1; i < desktops.length; i++) {
-            const otherDesktop = desktops[i];
-            const isOtherRunning = otherDesktop && (otherDesktop.useStatusText === '运行中' || otherDesktop.useStatus == 25);
-            if (isOtherRunning) {
-              await this.runDesktopKeepAliveSession(otherDesktop, false, 15);
-            }
+        for (const d of desktops) {
+          if (!this.workerRunning || this.isTaskHanging) break;
+          const isRunning = d && (d.useStatusText === '运行中' || d.useStatus == 25);
+          if (isRunning) {
+            this.metrics.desktopId = d.objId || d.desktopId;
+            this.metrics.desktopName = d.objName || d.desktopName || '云电脑';
+            await this.runDesktopKeepAliveSession(d, false, pulseConnectSec);
           }
+        }
 
-          // 对主机器执行挂机长连接
-          await this.runDesktopKeepAliveSession(mainDesktop, true, 3600);
-        } else {
-          // 脉冲防休眠模式：依次为名下每一台运行中的云电脑执行脉冲握手保活 (各保持 15~20 秒)
-          const pulseConnectSec = Math.min(60, Math.max(15, appConfig.settings?.keepAliveSeconds || 20));
-
-          for (const d of desktops) {
-            if (!this.workerRunning) break;
-            const isRunning = d && (d.useStatusText === '运行中' || d.useStatus == 25);
-            if (isRunning) {
-              this.metrics.desktopId = d.objId || d.desktopId;
-              this.metrics.desktopName = d.objName || d.desktopName || '云电脑';
-              await this.runDesktopKeepAliveSession(d, false, pulseConnectSec);
-            }
+        // 脉冲休眠间隔
+        const pulseGapSec = Math.min(3300, Math.max(10, parseInt(appConfig.settings?.pulseIntervalSeconds) || 30));
+        this.metrics.pulseIntervalSeconds = pulseGapSec;
+        let waited = 0;
+        while (waited < pulseGapSec && this.workerRunning && !this.isTaskHanging) {
+          if (this.account.sessionExpired) break;
+          if (this.isWebUserActive && Date.now() >= this.webUserActiveUntil) {
+            this.isWebUserActive = false;
           }
-
-          // 脉冲休眠间隔
-          const pulseGapSec = Math.min(3300, Math.max(10, parseInt(appConfig.settings?.pulseIntervalSeconds) || 30));
-          this.metrics.pulseIntervalSeconds = pulseGapSec;
-          let waited = 0;
-          while (waited < pulseGapSec && this.workerRunning) {
-            if (this.account.sessionExpired) break;
-            if (this.account.features?.cloudHang === true && !this.isTodayHangTaskCompleted()) {
-              appendLog('KeepAlive', `[${accName}] 用户开启了【云电脑挂机1小时】，切换至挂机模式！`, 'info');
-              break;
-            }
-            if (this.isWebUserActive && Date.now() >= this.webUserActiveUntil) {
-              this.isWebUserActive = false;
-            }
-            if (this.isWebUserActive && Date.now() < this.webUserActiveUntil) {
-              this.metrics.lastHeartbeatResult = '浏览器用户操作中，脉冲计时已暂停';
-              await new Promise(r => setTimeout(r, 5000));
-              waited = 0;
-              continue;
-            }
-            const remain = pulseGapSec - waited;
-            const remainText = remain >= 180 ? `约 ${Math.ceil(remain / 60)} 分钟` : `约 ${remain} 秒`;
-            const pulseReason = todayHangDone ? '今日任务已达标' : '未开启挂机功能';
-            const desktopNamesStr = desktops.map(d => d.objName || d.desktopName).filter(Boolean).join('、');
-            this.metrics.lastHeartbeatResult = `🟢 多机脉冲待机中 (${pulseReason}，名下 ${desktops.length} 台 [${desktopNamesStr}] 均已保活，${remainText}后下一轮脉冲)`;
-            await new Promise(r => setTimeout(r, 10000));
-            waited += 10;
+          if (this.isWebUserActive && Date.now() < this.webUserActiveUntil) {
+            this.metrics.lastHeartbeatResult = '浏览器用户操作中，脉冲计时已暂停';
+            await new Promise(r => setTimeout(r, 5000));
+            waited = 0;
+            continue;
           }
+          const remain = pulseGapSec - waited;
+          const remainText = remain >= 180 ? `约 ${Math.ceil(remain / 60)} 分钟` : `约 ${remain} 秒`;
+          const desktopNamesStr = desktops.map(d => d.objName || d.desktopName).filter(Boolean).join('、');
+          this.metrics.lastHeartbeatResult = `🟢 多机脉冲待机中 (名下 ${desktops.length} 台 [${desktopNamesStr}] 均已保活，${remainText}后下一轮脉冲)`;
+          await new Promise(r => setTimeout(r, 10000));
+          waited += 10;
         }
 
         await this.refreshOfficialTasks();
