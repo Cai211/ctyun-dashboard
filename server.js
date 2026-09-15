@@ -1558,11 +1558,12 @@ class CtYunClient {
       };
 
       if (isHangMode) {
-        const maxHangTimeout = 3600;
+        // 挂机会话时长：主挂机 3600 秒，尾差补挂按传入轮次时长 (上限 3600 秒)
+        const maxHangTimeout = Math.min(3600, Math.max(60, parseInt(pulseConnectSec) || 3600));
         this.metrics.keepAliveSeconds = maxHangTimeout;
         this.metrics.cycleCountdown = maxHangTimeout;
         sessionTimeout = setTimeout(() => {
-          appendLog('Heartbeat', `[${accName}][${desktopName}] 挂机长连接看门狗周期到，平滑刷新会话...`, 'info');
+          appendLog('Heartbeat', `[${accName}][${desktopName}] 挂机长连接看门狗周期到 (${maxHangTimeout}s)，平滑刷新会话...`, 'info');
           endSession('Hang Watchdog');
         }, maxHangTimeout * 1000);
       } else {
@@ -1865,46 +1866,74 @@ class CtYunClient {
     }
 
     try {
-      // 4. 获取目标云电脑并确保开机 (优先选择开启了任务与保活的云主机)
+      // 4. 获取目标云电脑并确保开机 (优选已在运行的主机，其次任务+保活双开的主机，避免挂机落空)
       const desktops = await this.getDesktops();
       if (!desktops || desktops.length === 0) {
         onLog('Hang', `[${accName}] 账号名下暂无可用云电脑，无法执行挂机任务。`, 'warning');
         return { success: false, isCompleted: false, message: '名下无云电脑' };
       }
 
-      const activeDesktops = desktops.filter(d => d.taskEnabled !== false && d.keepaliveEnabled !== false);
-      const fallbackDesktops = desktops.filter(d => d.taskEnabled !== false);
-      if (activeDesktops.length === 0 && fallbackDesktops.length === 0) {
+      const isDesktopRunning = (d) => d && (d.useStatusText === '运行中' || d.useStatus == 25);
+      const taskOnDesktops = desktops.filter(d => d.taskEnabled !== false);
+      if (taskOnDesktops.length === 0) {
         onLog('Hang', `[${accName}] 账号名下所有云电脑的【🎯 任务开关】均已关闭，本次挂机任务自动跳过。`, 'info');
         return { success: true, isCompleted: false, message: '名下所有云电脑均已关闭任务开关' };
       }
-      const mainDesktop = activeDesktops.length > 0 ? activeDesktops[0] : fallbackDesktops[0];
-      const targetName = mainDesktop.objName || mainDesktop.desktopName || '云电脑';
-      const isRunning = mainDesktop && (mainDesktop.useStatusText === '运行中' || mainDesktop.useStatus == 25);
 
-      if (!isRunning) {
+      const runningReady = taskOnDesktops.filter(d => isDesktopRunning(d) && d.keepaliveEnabled !== false);
+      const runningAny = taskOnDesktops.filter(d => isDesktopRunning(d));
+      const standbyReady = taskOnDesktops.filter(d => d.keepaliveEnabled !== false);
+      const mainDesktop = runningReady[0] || runningAny[0] || standbyReady[0] || taskOnDesktops[0];
+      const targetName = mainDesktop.objName || mainDesktop.desktopName || '云电脑';
+      const targetId = String(mainDesktop.objId || mainDesktop.desktopId);
+
+      if (!isDesktopRunning(mainDesktop)) {
         onLog('Hang', `[${accName}][${targetName}] 云电脑未开机，正在下发开机唤醒指令...`, 'info');
-        await this.controlPower(mainDesktop.objId || mainDesktop.desktopId, 'poweron').catch(() => {});
-        onLog('Hang', `[${accName}][${targetName}] 开机指令已下达，等待 25 秒启动就绪...`, 'info');
-        await new Promise(r => setTimeout(r, 25000));
+        await this.controlPower(targetId, 'poweron').catch(() => {});
+        // 开机就绪轮询 (最长 120 秒)：杜绝未就绪即认领导致官方计时不累加
+        let bootReady = false;
+        for (let i = 0; i < 12; i++) {
+          await new Promise(r => setTimeout(r, 10000));
+          const fresh = await this.getDesktops().catch(() => []);
+          const target = (fresh || []).find(d => String(d.objId || d.desktopId) === targetId);
+          if (isDesktopRunning(target)) { bootReady = true; break; }
+        }
+        onLog('Hang', `[${accName}][${targetName}] 开机就绪探测: ${bootReady ? '✅ 已进入运行中状态' : '⚠️ 120 秒未确认就绪，继续尝试认领'}`, bootReady ? 'success' : 'warning');
       }
 
       onLog('Hang', `[${accName}][${targetName}] 🚀 定时挂机任务已启动，正在建立独占会话累加使用时长...`, 'info');
 
-      // 5. 执行独占挂机长连接 (最长 3600 秒)
-      const result = await this.runDesktopKeepAliveSession(mainDesktop, true, 3600);
+      // 5. 执行主挂机长连接 (3600 秒) + 尾差自动补挂循环：确保官方计数真正到达 60/60
+      let attempt = 0;
+      let lastResult = null;
+      const MAX_ROUNDS = 4; // 1 轮主挂机 (3600s) + 最多 3 轮 10 分钟尾差补挂
+      while (attempt < MAX_ROUNDS) {
+        attempt++;
+        const roundSec = attempt === 1 ? 3600 : 600;
+        lastResult = await this.runDesktopKeepAliveSession(mainDesktop, true, roundSec);
 
-      // 6. 如果挂机过程中连接被断开 (被官方客户端顶掉或主动争抢)
-      if (result && (result.reason === 'occupied' || result.reason === 'Closed' || result.reason === 'Socket Error')) {
         await this.refreshOfficialTasks();
-        if (!this.isTodayHangTaskCompleted()) {
-          this.yieldToExternalClient(10);
-          onLog('Hang', `[${accName}][${targetName}] ⚠️ 挂机连接被中断 (检测到官方客户端登录)，后台已主动让位避让 10 分钟，绝不反抢客户端！`, 'warning');
+        if (this.isTodayHangTaskCompleted()) break;
+
+        // 中断防护：官方客户端接入时立即让位，绝不反抢 (由下一次调度再续)
+        if (lastResult && (lastResult.reason === 'occupied' || lastResult.reason === 'Closed' || lastResult.reason === 'Socket Error')) {
+          if (!this.isWebUserActive && Date.now() >= this.externalYieldUntil) {
+            this.yieldToExternalClient(10);
+            onLog('Hang', `[${accName}][${targetName}] ⚠️ 挂机连接被中断 (检测到官方客户端登录)，后台已主动让位避让 10 分钟，绝不反抢客户端！`, 'warning');
+          }
+          break;
+        }
+
+        if (attempt < MAX_ROUNDS) {
+          onLog('Hang', `[${accName}][${targetName}] 官方计时尚未达 60 分钟 (主挂机轮次 ${attempt} 结束)，正在自动补挂尾差...`, 'info');
         }
       }
 
       await this.refreshOfficialTasks();
       const isDone = this.isTodayHangTaskCompleted();
+      if (isDone) {
+        onLog('Hang', `[${accName}][${targetName}] 🎉 今日 1 小时挂机任务已圆满达成 (+100积分)！`, 'success');
+      }
       return {
         success: true,
         isCompleted: isDone,
