@@ -1904,18 +1904,47 @@ class CtYunClient {
       onLog('Hang', `[${accName}][${targetName}] 🚀 定时挂机任务已启动，正在建立独占会话累加使用时长...`, 'info');
 
       // 5. 执行主挂机长连接 (3600 秒) + 尾差自动补挂循环：确保官方计数真正到达 60/60
+      // 每一轮开始前重新校验避让状态与单机独立开关，与多机独立纳管/客户端避让机制完全兼容：
+      const USER_INTENT_STOP_REASONS = ['User Disabled Task on Active Desktop', 'Yield to External Client', 'Web User Active'];
       let attempt = 0;
       let lastResult = null;
       const MAX_ROUNDS = 4; // 1 轮主挂机 (3600s) + 最多 3 轮 10 分钟尾差补挂
       while (attempt < MAX_ROUNDS) {
         attempt++;
+
+        // 5.1 用户浏览器正在操作云电脑：挂机立即让位终止，绝不反抢
+        if (this.isWebUserActive && Date.now() < this.webUserActiveUntil) {
+          onLog('Hang', `[${accName}][${targetName}] 浏览器用户正在操作云电脑，挂机${attempt > 1 ? '补挂' : ''}主动让位终止。`, 'info');
+          break;
+        }
+        // 5.2 官方客户端避让冷却期内：终止本轮补挂 (由下一次调度再续)
+        if (Date.now() < this.externalYieldUntil) {
+          const waitMin = Math.ceil((this.externalYieldUntil - Date.now()) / 60000);
+          onLog('Hang', `[${accName}][${targetName}] 官方客户端避让冷却期内 (剩余 ${waitMin} 分钟)，挂机${attempt > 1 ? '补挂' : ''}终止。`, 'info');
+          break;
+        }
+        // 5.3 单机独立开关实时校验：用户在挂机途中关闭该主机的【🎯任务】或【⚡保活】开关，立即尊重用户意图终止
+        const freshTarget = (this.account.desktops || []).find(d => String(d.objId || d.desktopId) === targetId);
+        if (freshTarget && (freshTarget.taskEnabled === false || freshTarget.keepaliveEnabled === false)) {
+          onLog('Hang', `[${accName}][${targetName}] 检测到该主机的【🎯任务/⚡保活】开关已被用户关闭，挂机立即终止。`, 'info');
+          break;
+        }
+
         const roundSec = attempt === 1 ? 3600 : 600;
         lastResult = await this.runDesktopKeepAliveSession(mainDesktop, true, roundSec);
 
         await this.refreshOfficialTasks();
         if (this.isTodayHangTaskCompleted()) break;
 
-        // 中断防护：官方客户端接入时立即让位，绝不反抢 (由下一次调度再续)
+        const reasonStr = String((lastResult && lastResult.reason) || '');
+
+        // 5.4 用户意图中断 (单机关闭/客户端避让/浏览器接入)：直接终止，不再补挂
+        if (USER_INTENT_STOP_REASONS.includes(reasonStr)) {
+          onLog('Hang', `[${accName}][${targetName}] 挂机会话因避让或用户操作中断 (${reasonStr})，终止补挂。`, 'info');
+          break;
+        }
+
+        // 5.5 官方客户端接入中断：立即让位 10 分钟，绝不反抢 (由下一次调度再续)
         if (lastResult && (lastResult.reason === 'occupied' || lastResult.reason === 'Closed' || lastResult.reason === 'Socket Error')) {
           if (!this.isWebUserActive && Date.now() >= this.externalYieldUntil) {
             this.yieldToExternalClient(10);
