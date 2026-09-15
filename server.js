@@ -637,6 +637,8 @@ class CtYunClient {
     this.externalYieldUntil = 0; // 官方客户端抢占避让截止时间戳
     this.lastTokenRenewAt = Date.now();
     this.isTaskHanging = false; // 是否正在执行 Scheduler 精准调度的 1 小时挂机任务
+    this.hangRetryTimer = null; // 挂机任务自动重试定时器 (未达标自愈续跑)
+    this.hangRetryCount = 0;    // 当日挂机重试次数 (上限 24 次)
   }
 
   // 检测今日挂机 1 小时任务是否已达成 (严格依据今日真实达成状态)
@@ -668,6 +670,47 @@ class CtYunClient {
     if (this.endCurrentSession) {
       this.endCurrentSession('Yield to External Client');
     }
+  }
+
+  // 挂机任务自愈重试调度：今日任务未达成时自动续跑 (尊重避让冷却与用户操作，绝不反抢)
+  scheduleHangRetry(onLog = console.log) {
+    const accName = this.account.name || this.account.user;
+    if (this.hangRetryTimer) clearTimeout(this.hangRetryTimer);
+    if (this.account.features?.cloudHang === false) return;
+    if (this.account.enabled === false) return;
+    if (this.hangRetryCount >= 24) {
+      onLog('Hang', `[${accName}] 今日挂机自动重试已达上限 (24 次)，为避免夜间无谓重试已停止续跑，明日调度将自动执行。`, 'info');
+      return;
+    }
+
+    const nowTs = Date.now();
+    const yieldRemain = Math.max(this.externalYieldUntil - nowTs, 0);
+    const webRemain = (this.isWebUserActive && this.webUserActiveUntil > nowTs) ? (this.webUserActiveUntil - nowTs) : 0;
+    const maxRemain = Math.max(yieldRemain, webRemain);
+    // 有避让冷却时按冷却结束 + 30 秒精准续跑；无冷却时默认 5 分钟后重试
+    const delayMs = maxRemain > 0 ? (maxRemain + 30000) : (5 * 60 * 1000);
+    this.hangRetryCount++;
+    const waitMin = Math.max(1, Math.round(delayMs / 60000));
+    onLog('Hang', `[${accName}] 🕓 今日挂机任务尚未达成，已安排自动重试 (第 ${this.hangRetryCount}/24 次，约 ${waitMin} 分钟后自动续跑)...`, 'info');
+
+    this.hangRetryTimer = setTimeout(async () => {
+      this.hangRetryTimer = null;
+      try {
+        await this.runHangTask(onLog);
+      } catch (e) {
+        onLog('Hang', `[${accName}] 挂机自动重试异常: ${e.message}`, 'error');
+        this.scheduleHangRetry(onLog);
+      }
+    }, delayMs);
+  }
+
+  // 清除挂机重试定时器 (任务达成 / 用户关闭挂机开关时调用)
+  clearHangRetry() {
+    if (this.hangRetryTimer) {
+      clearTimeout(this.hangRetryTimer);
+      this.hangRetryTimer = null;
+    }
+    this.hangRetryCount = 0;
   }
 
   // 用户点击浏览器访问云电脑时调用：立即主动断开后台保活连接，并保持避让让位
@@ -1490,25 +1533,38 @@ class CtYunClient {
 
     let desktopInfo = null;
     let lastConnError = '';
-    for (let connAttempt = 1; connAttempt <= 4; connAttempt++) {
+    // 挂机模式加长重试窗口 (等待开机/网关就绪)：12 次 × 10 秒 ≈ 2 分钟；脉冲模式保持轻量 4 次 × 4 秒
+    const maxConnAttempts = isHangMode ? 12 : 4;
+    const retryGapMs = isHangMode ? 10000 : 4000;
+    for (let connAttempt = 1; connAttempt <= maxConnAttempts; connAttempt++) {
       try {
         desktopInfo = await this.connect(desktopId);
       } catch (e) {
         lastConnError = e.message || '';
       }
       if (desktopInfo && desktopInfo.clinkLvsOutHost) break;
-      if (lastConnError.includes('其他设备') || lastConnError.includes('其他地方') || lastConnError.includes('正在使用') ||
-          lastConnError.includes('占用') || lastConnError.includes('稍后再试') || lastConnError.includes('使用中')) {
+
+      // 先判定【开机/启动中】：此类报错 (如"正在启动中，请稍后再试") 属于等待就绪，绝非客户端占用，绝不误判让位！
+      const isBootingMsg = lastConnError.includes('启动') || lastConnError.includes('开机') || lastConnError.includes('初始化') || lastConnError.includes('唤醒');
+      // 再严格判定【客户端占用】：仅明确的占用信令才视为官方客户端接入
+      const isOccupiedMsg = !isBootingMsg && (
+        lastConnError.includes('其他设备') || lastConnError.includes('其他地方') ||
+        lastConnError.includes('正在使用') || lastConnError.includes('使用中') || lastConnError.includes('占用')
+      );
+      if (isOccupiedMsg) {
         appendLog('KeepAlive', `[${accName}][${desktopName}] 官方客户端可能正在使用，旁观通道将在下个周期自动重试。`, 'info');
         return { success: true, reason: 'occupied' };
       }
-      if (connAttempt < 4) {
-        await new Promise(r => setTimeout(r, 4000));
+      if (connAttempt < maxConnAttempts) {
+        if (lastConnError) {
+          appendLog('KeepAlive', `[${accName}][${desktopName}] 连接暂未就绪 (${lastConnError})，${Math.round(retryGapMs / 1000)} 秒后自动重试 (${connAttempt}/${maxConnAttempts})...`, 'info');
+        }
+        await new Promise(r => setTimeout(r, retryGapMs));
       }
     }
 
     if (!desktopInfo || !desktopInfo.clinkLvsOutHost) {
-      appendLog('KeepAlive', `[${accName}][${desktopName}] 视讯网关暂未分配完毕，跳过本次连接`, 'warning');
+      appendLog('KeepAlive', `[${accName}][${desktopName}] 视讯网关暂未分配完毕 (已重试 ${maxConnAttempts} 次)，跳过本次连接`, 'warning');
       return { success: false, reason: 'no_gateway' };
     }
 
@@ -1840,21 +1896,30 @@ class CtYunClient {
   async runHangTask(onLog = console.log) {
     const accName = this.account.name || this.account.user;
 
+    // 本次任务已实际执行，先清除待触发的重试定时器 (避免重影)
+    if (this.hangRetryTimer) {
+      clearTimeout(this.hangRetryTimer);
+      this.hangRetryTimer = null;
+    }
+
     // 1. 检查今日挂机 1 小时是否已达成
     await this.refreshOfficialTasks();
     if (this.isTodayHangTaskCompleted()) {
+      this.clearHangRetry();
       onLog('Hang', `[${accName}] ✅ 今日云电脑 1 小时挂机任务已达成 (+100积分)，无需重复执行。`, 'success');
       return { success: true, isCompleted: true, message: '今日挂机时长已满 60 分钟' };
     }
 
-    // 2. 检查用户与客户端避让状态
+    // 2. 检查用户与客户端避让状态 (避让后自动安排续跑，绝不静默丢弃今日任务)
     if (this.isWebUserActive && Date.now() < this.webUserActiveUntil) {
       onLog('Hang', `[${accName}] 浏览器用户正在操作云电脑，本次挂机任务主动避让。`, 'info');
+      this.scheduleHangRetry(onLog);
       return { success: true, isCompleted: false, message: '用户网页操作中，主动避让' };
     }
     if (Date.now() < this.externalYieldUntil) {
       const waitMin = Math.ceil((this.externalYieldUntil - Date.now()) / 60000);
       onLog('Hang', `[${accName}] 官方客户端 (App/PC) 近期正在使用，挂机任务处于避让冷却期 (剩余 ${waitMin} 分钟)，跳过本次抢占。`, 'info');
+      this.scheduleHangRetry(onLog);
       return { success: true, isCompleted: false, message: '处于客户端避让冷却期' };
     }
 
@@ -1870,6 +1935,7 @@ class CtYunClient {
       const desktops = await this.getDesktops();
       if (!desktops || desktops.length === 0) {
         onLog('Hang', `[${accName}] 账号名下暂无可用云电脑，无法执行挂机任务。`, 'warning');
+        this.scheduleHangRetry(onLog);
         return { success: false, isCompleted: false, message: '名下无云电脑' };
       }
 
@@ -1961,7 +2027,11 @@ class CtYunClient {
       await this.refreshOfficialTasks();
       const isDone = this.isTodayHangTaskCompleted();
       if (isDone) {
+        this.clearHangRetry();
         onLog('Hang', `[${accName}][${targetName}] 🎉 今日 1 小时挂机任务已圆满达成 (+100积分)！`, 'success');
+      } else {
+        // 未达标的自愈续跑：静默等待冷却后自动重试，绝不把今日任务丢给明天
+        this.scheduleHangRetry(onLog);
       }
       return {
         success: true,
@@ -3575,6 +3645,9 @@ function rewardNeedsDesktop(prodId, prodType) {
     if (body.features && body.features.cloudHang === false) {
       if (client.endCurrentSession) {
         client.endCurrentSession('User Disabled Hang Mode');
+      }
+      if (client.clearHangRetry) {
+        client.clearHangRetry();
       }
     }
 
