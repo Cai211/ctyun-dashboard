@@ -713,6 +713,26 @@ class CtYunClient {
     this.hangRetryCount = 0;
   }
 
+  // 挂机中断来源证据化鉴别：观察 90 秒官方计时是否继续增长
+  // 真实客户端正在使用 → 官方计时持续增长 (real_client)；己方残留会话/网关误报 → 计时冻结 (false_alarm)
+  async diagnoseHangInterruption(onLog = console.log, targetName = '云电脑') {
+    const accName = this.account.name || this.account.user;
+    const getUsage = () => {
+      const t = this.metrics.officialTasks?.find(x => x.name.includes('使用1小时'));
+      return t ? (t.current || 0) : 0;
+    };
+    await this.refreshOfficialTasks();
+    if (this.isTodayHangTaskCompleted()) return 'completed';
+    const before = getUsage();
+    onLog('Hang', `[${targetName}] 🔎 正在鉴别中断来源 (观察 90 秒官方计时是否继续增长)...`, 'info');
+    await new Promise(r => setTimeout(r, 90000));
+    await this.refreshOfficialTasks();
+    if (this.isTodayHangTaskCompleted()) return 'completed';
+    const after = getUsage();
+    appendLog('Hang', `[${accName}][${targetName}] 中断鉴别结果: 90 秒内官方计时 ${before}s → ${after}s (${after > before ? '持续增长=真实客户端' : '冻结=误报'})`, 'info');
+    return (after - before) >= 60 ? 'real_client' : 'false_alarm';
+  }
+
   // 用户点击浏览器访问云电脑时调用：立即主动断开后台保活连接，并保持避让让位
   yieldToWebUser(durationMinutes = 60) {
     const accName = this.account.name || this.account.user;
@@ -1879,9 +1899,11 @@ class CtYunClient {
         if (isClosingSelf) {
           appendLog('Heartbeat', `[${accName}][${desktopName}] 保活长连接正常轮转关闭 (${code} - ${reason || '周期重连'})`, 'info');
         } else if (code >= 4000 || reasonStr.includes('preempt') || reasonStr.includes('kick') || reasonStr.includes('conflict')) {
-          appendLog('Heartbeat', `[${accName}][${desktopName}] 收到网关信令 (${code})，旁观通道随即让位，将按脉冲周期自动重连。`, 'info');
+          appendLog('Heartbeat', `[${accName}][${desktopName}] 收到网关抢占信令 (${code})，确认为官方客户端接入信号。`, 'info');
+          endSession('Preempted by Client');
+          return;
         } else {
-          appendLog('Heartbeat', `[${accName}][${desktopName}] 旁观通道被网关断开 (状态码: ${code}，已保持 ${heldSec} 秒)，属正常现象，按脉冲周期自动重连。`, 'info');
+          appendLog('Heartbeat', `[${accName}][${desktopName}] 通道被网关断开 (状态码: ${code}，已保持 ${heldSec} 秒)，属网络/网关抖动，挂机将自动重连。`, 'info');
         }
         endSession('Closed');
       });
@@ -1974,6 +1996,8 @@ class CtYunClient {
       const USER_INTENT_STOP_REASONS = ['User Disabled Task on Active Desktop', 'Yield to External Client', 'Web User Active'];
       let attempt = 0;
       let lastResult = null;
+      let transientRetries = 0;   // 网络闪断自动重连预算
+      let falseAlarmRetries = 0;  // 占用误报自动重连预算
       const MAX_ROUNDS = 4; // 1 轮主挂机 (3600s) + 最多 3 轮 10 分钟尾差补挂
       while (attempt < MAX_ROUNDS) {
         attempt++;
@@ -2010,17 +2034,54 @@ class CtYunClient {
           break;
         }
 
-        // 5.5 官方客户端接入中断：立即让位 10 分钟，绝不反抢 (由下一次调度再续)
-        if (lastResult && (lastResult.reason === 'occupied' || lastResult.reason === 'Closed' || lastResult.reason === 'Socket Error')) {
+        // 5.5 网关抢占信令 (code>=4000)：官方客户端接入的确凿证据，让位 10 分钟
+        if (reasonStr === 'Preempted by Client') {
           if (!this.isWebUserActive && Date.now() >= this.externalYieldUntil) {
             this.yieldToExternalClient(10);
-            onLog('Hang', `[${accName}][${targetName}] ⚠️ 挂机连接被中断 (检测到官方客户端登录)，后台已主动让位避让 10 分钟，绝不反抢客户端！`, 'warning');
+            onLog('Hang', `[${targetName}] ⚠️ 收到网关抢占信令，确认官方客户端接入，已让位避让 10 分钟，绝不反抢！`, 'warning');
           }
           break;
         }
 
+        // 5.6 API 占用信令：先做 90 秒证据鉴别 (真实客户端使用时官方计时持续增长；己方残留会话/误报则计时冻结)
+        if (reasonStr === 'occupied') {
+          const verdict = await this.diagnoseHangInterruption(onLog, targetName);
+          if (verdict === 'completed') break;
+          if (verdict === 'real_client') {
+            if (!this.isWebUserActive && Date.now() >= this.externalYieldUntil) {
+              this.yieldToExternalClient(10);
+              onLog('Hang', `[${targetName}] ⚠️ 确认官方客户端正在使用 (中断后官方计时仍在增长)，已让位避让 10 分钟，绝不反抢！`, 'warning');
+            }
+            break;
+          }
+          falseAlarmRetries++;
+          if (falseAlarmRetries > 6) {
+            onLog('Hang', `[${targetName}] 占用误报重试已达上限，转入定时自动续跑。`, 'info');
+            this.scheduleHangRetry(onLog);
+            break;
+          }
+          attempt--;
+          onLog('Hang', `[${targetName}] 🔍 占用信令为误报 (官方计时未增长，非真实客户端)，60 秒后立即重连续挂 (${falseAlarmRetries}/6)...`, 'info');
+          await new Promise(r => setTimeout(r, 60000));
+          continue;
+        }
+
+        // 5.7 网络闪断/Socket 错误/网关未就绪：短暂退避自动重连续跑，绝不误判为客户端登录！
+        if (reasonStr === 'Closed' || reasonStr === 'Socket Error' || reasonStr === 'no_gateway') {
+          transientRetries++;
+          if (transientRetries > 10) {
+            onLog('Hang', `[${targetName}] 网络闪断重试已达上限，转入定时自动续跑。`, 'info');
+            this.scheduleHangRetry(onLog);
+            break;
+          }
+          attempt--;
+          onLog('Hang', `[${targetName}] 挂机通道闪断 (${reasonStr})，45 秒后自动重连续跑 (${transientRetries}/10)...`, 'warning');
+          await new Promise(r => setTimeout(r, 45000));
+          continue;
+        }
+
         if (attempt < MAX_ROUNDS) {
-          onLog('Hang', `[${accName}][${targetName}] 官方计时尚未达 60 分钟 (主挂机轮次 ${attempt} 结束)，正在自动补挂尾差...`, 'info');
+          onLog('Hang', `[${targetName}] 官方计时尚未达 60 分钟 (主挂机轮次 ${attempt} 结束)，正在自动补挂尾差...`, 'info');
         }
       }
 
