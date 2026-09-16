@@ -2180,6 +2180,27 @@ function openSmsModal(accId) {
   refreshSmsCaptcha();
 }
 
+// 方案 B：从短信弹窗一键切换到手机 App 扫码授信 (免短信，官方 App 扫码即自动信任设备)
+function openQrTrustFromSms() {
+  const accId = document.getElementById("sms-acc-id").value;
+  const acc = accounts.find(a => a.id === accId);
+  if (!acc) return;
+  closeModal("sms-modal");
+
+  // 复用天翼云官方扫码重授权链路：指定目标账号 ID，扫码确认后官方自动将该设备码标记为永久信任
+  document.getElementById("acc-id").value = acc.id;
+  const titleEl = document.getElementById("modal-account-title");
+  if (titleEl) titleEl.innerText = `📱 扫码一键信任设备 [${acc.name || acc.user}] (免短信)`;
+  const qrNameEl = document.getElementById("qrcode-acc-name");
+  if (qrNameEl) qrNameEl.value = acc.name || "";
+  const tabContainer = document.getElementById("acc-login-tabs");
+  if (tabContainer) tabContainer.style.display = "none";
+
+  openModal("account-modal");
+  switchAddAccountPlatform('ctyun');
+  switchAccountLoginTab('qrcode');
+}
+
 // 拉取天翼云官方短信流程图形验证码 (点击图片亦可刷新)
 async function refreshSmsCaptcha() {
   const accId = document.getElementById("sms-acc-id").value;

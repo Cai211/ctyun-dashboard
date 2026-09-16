@@ -300,6 +300,14 @@
         <p style="font-size: 13px; color: var(--text-muted);">
           由于当前设备首次登录或安全风控策略，天翼云需要向手机号验证授权。验证后将永久信任该设备码！
         </p>
+        <button type="button" class="btn btn-primary" style="width: 100%; padding: 9px 12px; font-size: 13px; margin-bottom: 6px;" onclick="openQrTrustFromSms()">
+          📱 手机 App 扫码一键信任设备 (免短信 · 推荐)
+        </button>
+        <div style="display: flex; align-items: center; gap: 10px; margin: 10px 0 12px 0;">
+          <div style="flex: 1; height: 1px; background: var(--border);"></div>
+          <span style="font-size: 11px; color: var(--text-muted); white-space: nowrap;">或使用短信验证</span>
+          <div style="flex: 1; height: 1px; background: var(--border);"></div>
+        </div>
         <div class="form-group">
           <label>目标手机号</label>
           <input type="text" class="form-control" id="sms-phone" readonly disabled>
