@@ -171,25 +171,60 @@ async function executeNativeAiChat(client, acc, onLog = console.log) {
 }
 
 /**
- * 登录打卡
+ * 登录打卡 (严格对齐天翼云官方鉴权中心 tokenLogin 真实登录事件)
  */
 async function executeNativeSign(client, acc, onLog = console.log) {
-  onLog('Sign', `正在执行登录打卡认证...`, 'info');
+  const accName = acc.name || acc.user;
+  onLog('Sign', `正在执行天翼云官方登录打卡认证...`, 'info');
   try {
-    const res = await client.login();
-    if (!res.success) throw new Error(res.error || '登录握手失败');
-    await client.getDesktops();
-
-    // 确保长连接握手通道激活并发送 Type 112 登录凭据包
-    if (!client.wsAlive) {
-      onLog('Sign', `正在激活云电脑握手通道...`, 'info');
-      client.startKeepAliveWorker();
+    // 1. 检查今日是否已在官方任务中心完成
+    await client.refreshOfficialTasks();
+    const loginTask = client.metrics.officialTasks?.find(t => t.name.includes('登录AI云电脑') || t.name.includes('登录'));
+    if (loginTask && (loginTask.status === 2 || (loginTask.total > 0 && loginTask.current >= loginTask.total))) {
+      onLog('Sign', `✅ 今日登录打卡任务已在官方达成 (+100积分)，无需重复执行。`, 'success');
+      return { success: true, isCompleted: true, message: '今日已完成登录打卡' };
     }
 
-    await new Promise(r => setTimeout(r, 2500));
+    // 2. 核心修复：真实触发天翼云官方鉴权中心登录事件 (通过 genLoginToken + tokenLogin 真实调用官方 /api/auth/client/tokenLogin)
+    // 这不仅使天翼云服务端明确记录到今日的正式登录事件，还同时实现 Token 静默轮转保鲜
+    if (typeof client.renewToken === 'function') {
+      try {
+        onLog('Sign', `正在向官方鉴权中心下发真实登录握手 (tokenLogin)...`, 'info');
+        await client.renewToken();
+      } catch (e) {
+        onLog('Sign', `Token 轮转登录提示: ${e.message}，尝试直接鉴权...`, 'warning');
+        const res = await client.login();
+        if (!res.success) throw new Error(res.error || '登录握手失败');
+      }
+    } else {
+      const res = await client.login();
+      if (!res.success) throw new Error(res.error || '登录握手失败');
+    }
+
+    // 3. 同步拉取最新云电脑设备列表并触发一次桌面网关连接握手
+    const desktops = await client.getDesktops().catch(() => []);
+    if (desktops && desktops.length > 0) {
+      const mainD = desktops.find(d => d.taskEnabled !== false) || desktops[0];
+      const dId = mainD.objId || mainD.desktopId;
+      if (dId && typeof client.connect === 'function') {
+        await client.connect(dId).catch(() => {});
+      }
+    }
+
+    // 4. 等待 3 秒让天翼云营销积分系统记录登录事件，并重新拉取官方任务中心确认
+    await new Promise(r => setTimeout(r, 3000));
     await client.refreshOfficialTasks();
-    onLog('Sign', `✅ 登录打卡握手完成！已同步上报天翼云任务中心！`, 'success');
-    return { success: true, message: '打卡成功，官方积分已刷新' };
+
+    const verifiedTask = client.metrics.officialTasks?.find(t => t.name.includes('登录AI云电脑') || t.name.includes('登录'));
+    const isDone = verifiedTask ? (verifiedTask.status === 2 || (verifiedTask.total > 0 && verifiedTask.current >= verifiedTask.total)) : false;
+
+    if (isDone) {
+      onLog('Sign', `🎉 官方任务中心已确认【登录AI云电脑】达成 (+100积分)！`, 'success');
+    } else {
+      onLog('Sign', `✅ 官方登录打卡信令与桌面握手已全部完成 (官方积分通常在数分钟内同步到账)。`, 'info');
+    }
+
+    return { success: true, isCompleted: isDone, message: isDone ? '官方已确认登录打卡完成' : '打卡信令已下发' };
   } catch (e) {
     onLog('Sign', `登录打卡异常: ${e.message}`, 'error');
     throw e;
