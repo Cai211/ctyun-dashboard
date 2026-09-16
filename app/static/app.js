@@ -2167,26 +2167,68 @@ async function deleteAccount(accId) {
   }
 }
 
-// 4. 短信验证码绑定设备
+// 4. 短信验证码绑定设备 (含官方图形验证码前置校验链路)
 function openSmsModal(accId) {
   const acc = accounts.find(a => a.id === accId);
   if (!acc) return;
   document.getElementById("sms-acc-id").value = acc.id;
   document.getElementById("sms-phone").value = acc.user;
   document.getElementById("sms-code").value = "";
+  document.getElementById("sms-captcha-code").value = "";
+  document.getElementById("sms-captcha-key").value = "";
   openModal("sms-modal");
+  refreshSmsCaptcha();
+}
+
+// 拉取天翼云官方短信流程图形验证码 (点击图片亦可刷新)
+async function refreshSmsCaptcha() {
+  const accId = document.getElementById("sms-acc-id").value;
+  if (!accId) return;
+  const imgEl = document.getElementById("sms-captcha-img");
+  const loadingEl = document.getElementById("sms-captcha-loading");
+  if (imgEl) imgEl.style.display = "none";
+  if (loadingEl) loadingEl.style.display = "flex";
+  try {
+    const res = await authFetch(`/api/accounts/${accId}/sms-captcha`);
+    const data = await res.json();
+    if (res.ok && data.success) {
+      document.getElementById("sms-captcha-key").value = data.captchaKey || "";
+      if (imgEl) {
+        imgEl.src = data.captchaImage;
+        imgEl.style.display = "block";
+      }
+      if (loadingEl) loadingEl.style.display = "none";
+    } else {
+      if (loadingEl) loadingEl.innerHTML = `<span style="color:#ef4444; font-size:11px;">加载失败<br>点击重试</span>`;
+      loadingEl && (loadingEl.onclick = () => refreshSmsCaptcha());
+    }
+  } catch (e) {
+    if (loadingEl) loadingEl.innerHTML = `<span style="color:#ef4444; font-size:11px;">网络异常<br>点击重试</span>`;
+    loadingEl && (loadingEl.onclick = () => refreshSmsCaptcha());
+  }
 }
 
 async function sendSmsCode() {
   const accId = document.getElementById("sms-acc-id").value;
   const btn = document.getElementById("btn-send-sms");
+  const captchaCode = document.getElementById("sms-captcha-code").value.trim();
+  const captchaKey = document.getElementById("sms-captcha-key").value.trim();
+
   if (smsCountdown > 0) return;
+  if (!captchaCode) {
+    showToast("请先输入图形验证码", "error");
+    return;
+  }
 
   btn.innerText = "发送中...";
   btn.disabled = true;
 
   try {
-    const res = await authFetch(`/api/accounts/${accId}/send-sms`, { method: "POST" });
+    const res = await authFetch(`/api/accounts/${accId}/send-sms`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ captchaCode, captchaKey })
+    });
     const data = await res.json();
     if (res.ok) {
       showToast("验证码发送成功，请查收手机短信", "success");
@@ -2205,6 +2247,9 @@ async function sendSmsCode() {
       showToast("发送短信失败: " + (data.message || data.error), "error");
       btn.innerText = "获取验证码";
       btn.disabled = false;
+      // 图验校验失败后自动刷新图形验证码以便重试
+      refreshSmsCaptcha();
+      document.getElementById("sms-captcha-code").value = "";
     }
   } catch (e) {
     showToast("请求异常: " + e.message, "error");

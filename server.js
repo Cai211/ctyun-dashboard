@@ -1134,6 +1134,67 @@ class CtYunClient {
     return json.data;
   }
 
+  // 获取绑定设备短信图形验证码
+  async getSmsCodeCaptcha() {
+    const timestamp = Date.now();
+    const url = `https://desk.ctyun.cn:8810/api/auth/client/validateCode/captcha?width=120&height=40&_t=${timestamp}`;
+    const res = await fetchWithTimeout(url, { headers: this.getSignedHeaders() });
+    if (!res.ok) {
+      throw new Error(`获取短信验证码图验失败: HTTP ${res.status}`);
+    }
+    const captchaKey = res.headers.get('ctg-captcha-key') || res.headers.get('CTG-CAPTCHA-KEY') || '';
+    const arrayBuffer = await res.arrayBuffer();
+    const base64Img = `data:image/jpeg;base64,${Buffer.from(arrayBuffer).toString('base64')}`;
+    return { captchaImage: base64Img, captchaKey };
+  }
+
+  // 发送短信验证码 (官方风控要求携带 captchaCode 与 captchaCodeKey)
+  async sendSmsCode(userPhone, captchaCode, captchaCodeKey = '') {
+    let url = `https://desk.ctyun.cn:8810/api/cdserv/client/device/getSmsCode?mobilePhone=${encodeURIComponent(userPhone)}&captchaCode=${encodeURIComponent(captchaCode)}`;
+    if (captchaCodeKey) {
+      url += `&captchaCodeKey=${encodeURIComponent(captchaCodeKey)}`;
+    }
+    const res = await fetchWithTimeout(url, { headers: this.getSignedHeaders() });
+    const smsKey = res.headers.get('ctg-sms-key') || res.headers.get('CTG-SMS-KEY') || '';
+    const json = await res.json();
+    if (json.code !== 0 && json.code !== 200) {
+      throw new Error(json.msg || '发送短信验证码失败');
+    }
+    return { success: true, smsKey };
+  }
+
+  // 绑定设备 (官方要求携带 verificationCode 与 smsCodeKey)
+  async bindDevice(verificationCode, smsCodeKey = '') {
+    const formData = new URLSearchParams();
+    formData.append('verificationCode', verificationCode.trim());
+    if (smsCodeKey) {
+      formData.append('smsCodeKey', smsCodeKey.trim());
+    }
+    formData.append('deviceName', 'Chrome浏览器');
+    formData.append('deviceCode', this.account.deviceCode);
+    formData.append('deviceModel', 'Windows NT 10.0; Win64; x64');
+    formData.append('sysVersion', 'Windows NT 10.0; Win64; x64');
+    formData.append('appVersion', '3.2.0');
+    formData.append('hostName', 'pc.ctyun.cn');
+    formData.append('deviceInfo', 'Win32');
+
+    const url = 'https://desk.ctyun.cn:8810/api/cdserv/client/device/binding';
+    const res = await fetchWithTimeout(url, {
+      method: 'POST',
+      headers: this.getSignedHeaders({ 'Content-Type': 'application/x-www-form-urlencoded' }),
+      body: formData.toString()
+    });
+
+    const json = await res.json();
+    if (json.code !== 0 && json.code !== 200) {
+      throw new Error(json.msg || '绑定设备失败');
+    }
+    if (this.loginInfo) {
+      this.loginInfo.bondedDevice = true;
+    }
+    return { success: true };
+  }
+
   async getDesktops() {
     if (!this.loginInfo) {
       return this.desktopsCache || [];
@@ -4011,7 +4072,41 @@ function rewardNeedsDesktop(prodId, prodType) {
     return;
   }
 
-  // 12. 发送短信验证码
+  // 12.1 获取设备绑定短信流程的图形验证码 (严格对齐官方 /api/auth/client/validateCode/captcha 链路)
+  if (req.method === 'GET' && pathname.match(/^\/api\/accounts\/[^\/]+\/sms-captcha$/)) {
+    const session = getSessionFromReq(req);
+    if (!session) {
+      jsonResponse(res, { error: '未授权：请登录后再操作' }, 401);
+      return;
+    }
+    const accId = pathname.split('/')[3];
+    const acc = appConfig.accounts.find(a => a.id === accId);
+    if (!acc) {
+      jsonResponse(res, { error: '账号不存在' }, 404);
+      return;
+    }
+    if (!canUserAccessAccount(session, acc)) {
+      jsonResponse(res, { error: '权限不足：无权操作该云电脑账号' }, 403);
+      return;
+    }
+
+    const client = getClient(acc);
+    try {
+      const timestamp = Date.now();
+      const capUrl = `https://desk.ctyun.cn:8810/api/auth/client/validateCode/captcha?width=120&height=40&_t=${timestamp}`;
+      const capRes = await fetch(capUrl, { headers: client.getSignedHeaders() });
+      if (!capRes.ok) throw new Error(`获取短信图验失败: HTTP ${capRes.status}`);
+      const captchaKey = capRes.headers.get('ctg-captcha-key') || capRes.headers.get('CTG-CAPTCHA-KEY') || '';
+      const imgBuf = Buffer.from(await capRes.arrayBuffer());
+      const base64Img = `data:image/jpeg;base64,${imgBuf.toString('base64')}`;
+      jsonResponse(res, { success: true, captchaImage: base64Img, captchaKey });
+    } catch (e) {
+      jsonResponse(res, { error: e.message }, 500);
+    }
+    return;
+  }
+
+  // 12. 发送短信验证码 (需先通过官方图形验证码校验，并透传 ctg-sms-key)
   if (req.method === 'POST' && pathname.includes('/send-sms')) {
     const session = getSessionFromReq(req);
     if (!session) {
@@ -4033,6 +4128,7 @@ function rewardNeedsDesktop(prodId, prodType) {
 
     const body = await parseJsonBody(req);
     const captchaCode = (body.captchaCode || '').trim();
+    const captchaCodeKey = (body.captchaKey || '').trim();
     if (!captchaCode) {
       jsonResponse(res, { error: '请先输入图形验证码后再获取短信验证码！' }, 400);
       return;
@@ -4041,10 +4137,18 @@ function rewardNeedsDesktop(prodId, prodType) {
     const client = getClient(acc);
     try {
       appendLog('Auth', `[${acc.name}] 正在请求天翼云下发设备绑定验证码...`, 'info');
-      const url = `https://desk.ctyun.cn:8810/api/cdserv/client/device/getSmsCode?mobilePhone=${acc.user}&captchaCode=${encodeURIComponent(captchaCode)}`;
+      let url = `https://desk.ctyun.cn:8810/api/cdserv/client/device/getSmsCode?mobilePhone=${acc.user}&captchaCode=${encodeURIComponent(captchaCode)}`;
+      if (captchaCodeKey) {
+        url += `&captchaCodeKey=${encodeURIComponent(captchaCodeKey)}`;
+      }
       const resSms = await fetch(url, { headers: client.getSignedHeaders() });
       const dataSms = await resSms.json();
-      if (dataSms.code === 0) {
+      const smsKey = resSms.headers.get('ctg-sms-key') || resSms.headers.get('CTG-SMS-KEY') || '';
+      if (dataSms.code === 0 || dataSms.code === 200) {
+        if (smsKey) {
+          acc._smsCodeKey = smsKey;
+          saveConfig(appConfig);
+        }
         appendLog('Auth', `[${acc.name}] 短信验证码已发送至手机 ${acc.user}`, 'success');
         jsonResponse(res, { success: true, message: '验证码发送成功' });
       } else {
@@ -4085,11 +4189,29 @@ function rewardNeedsDesktop(prodId, prodType) {
     }
     const client = getClient(acc);
     try {
-      const url = `https://desk.ctyun.cn:8810/api/cdserv/client/device/binding?verificationCode=${code}&deviceName=Chrome%E6%B5%8F%E8%A7%88%E5%99%A8&deviceCode=${acc.deviceCode}&deviceModel=Windows+NT+10.0%3B+Win64%3B+x64&sysVersion=Windows+NT+10.0%3B+Win64%3B+x64&appVersion=3.2.0&hostName=pc.ctyun.cn&deviceInfo=Win32`;
-      const bindRes = await fetch(url, { method: 'POST', headers: client.getSignedHeaders() });
+      const smsCodeKey = (body.smsCodeKey || acc._smsCodeKey || '').trim();
+      const form = new URLSearchParams({
+        verificationCode: code,
+        deviceName: 'Chrome浏览器',
+        deviceCode: acc.deviceCode || '',
+        deviceModel: 'Windows NT 10.0; Win64; x64',
+        sysVersion: 'Windows NT 10.0; Win64; x64',
+        appVersion: '3.2.0',
+        hostName: 'pc.ctyun.cn',
+        deviceInfo: 'Win32'
+      });
+      if (smsCodeKey) {
+        form.append('smsCodeKey', smsCodeKey);
+      }
+      const bindRes = await fetch('https://desk.ctyun.cn:8810/api/cdserv/client/device/binding', {
+        method: 'POST',
+        headers: { ...client.getSignedHeaders(), 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: form.toString()
+      });
       const bindData = await bindRes.json();
-      if (bindData.code === 0) {
+      if (bindData.code === 0 || bindData.code === 200) {
         acc.bound = true;
+        delete acc._smsCodeKey;
         saveConfig(appConfig);
         appendLog('Auth', `[${acc.name}] 恭喜！新设备验证通过，设备码永久信任！`, 'success');
         client.startKeepAliveWorker();
