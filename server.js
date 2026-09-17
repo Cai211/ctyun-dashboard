@@ -890,7 +890,7 @@ class CtYunClient {
     const timestamp = Date.now().toString();
     const str = `${this.deviceType}${timestamp}${this.loginInfo.tenantId}${timestamp}${this.loginInfo.userId}${this.version}${this.loginInfo.secretKey}`;
     const sig = md5(str);
-    return {
+    const headers = {
       'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/137.0.0.0',
       'ctg-devicetype': this.deviceType,
       'ctg-version': this.version,
@@ -903,6 +903,12 @@ class CtYunClient {
       'referer': 'https://pc.ctyun.cn/',
       ...customHeaders
     };
+    // 协议对齐 ctyun-pro：官方会话令牌 Cookie (genLoginToken/tokenLogin 等鉴权签发类接口
+    // 依赖此 Cookie 关联"当前设备会话"；缺失时官方按未知设备处理，导致免密凭据被拒)
+    if (this.loginInfo.token) {
+      headers['Cookie'] = `token=${this.loginInfo.token}`;
+    }
+    return headers;
   }
 
   // 智能解析云电脑硬件规格 (完全对齐 ctyun-pro parseDesktopSpec 策略)
