@@ -185,20 +185,19 @@ async function executeNativeSign(client, acc, onLog = console.log) {
       return { success: true, isCompleted: true, message: '今日已完成登录打卡' };
     }
 
-    // 2. 核心修复：真实触发天翼云官方鉴权中心登录事件 (通过 genLoginToken + tokenLogin 真实调用官方 /api/auth/client/tokenLogin)
+    // 2. 核心修复：真实触发天翼云官方鉴权中心登录事件 (genLoginToken + tokenLogin 真实调用官方 /api/auth/client/tokenLogin)
     // 这不仅使天翼云服务端明确记录到今日的正式登录事件，还同时实现 Token 静默轮转保鲜
-    if (typeof client.renewToken === 'function') {
-      try {
-        onLog('Sign', `正在向官方鉴权中心下发真实登录握手 (tokenLogin)...`, 'info');
-        await client.renewToken();
-      } catch (e) {
-        onLog('Sign', `Token 轮转登录提示: ${e.message}，尝试直接鉴权...`, 'warning');
-        const res = await client.login();
-        if (!res.success) throw new Error(res.error || '登录握手失败');
-      }
-    } else {
+    let realLoginDone = false;
+    try {
+      onLog('Sign', `正在向官方鉴权中心下发真实登录握手 (tokenLogin)...`, 'info');
+      await client.renewToken();
+      realLoginDone = true;
+    } catch (e) {
+      onLog('Sign', `Token 轮转登录提示: ${e.message}，尝试直接鉴权...`, 'warning');
       const res = await client.login();
       if (!res.success) throw new Error(res.error || '登录握手失败');
+      // fromCache=true 表示命中内存会话，未产生任何真实登录事件
+      realLoginDone = res.fromCache !== true;
     }
 
     // 3. 同步拉取最新云电脑设备列表并触发一次桌面网关连接握手
@@ -220,11 +219,15 @@ async function executeNativeSign(client, acc, onLog = console.log) {
 
     if (isDone) {
       onLog('Sign', `🎉 官方任务中心已确认【登录AI云电脑】达成 (+100积分)！`, 'success');
+    } else if (!realLoginDone) {
+      // 关键加固：免密凭据被官方拒绝 (设备未授信) 且兜底命中缓存时，绝不虚报完成
+      onLog('Sign', `⚠️ 官方拒绝了免密登录凭据 (当前设备未获授信)，本次未能产生真实登录事件，登录打卡暂时无法在官方记为达成。`, 'warning');
+      onLog('Sign', `👉 请先在卡片完成【设备绑定】(📱 扫码一键授信 或 图验+短信验证) —— 设备授信后每日签到与静默续期将全部自动生效。`, 'warning');
     } else {
       onLog('Sign', `✅ 官方登录打卡信令与桌面握手已全部完成 (官方积分通常在数分钟内同步到账)。`, 'info');
     }
 
-    return { success: true, isCompleted: isDone, message: isDone ? '官方已确认登录打卡完成' : '打卡信令已下发' };
+    return { success: true, isCompleted: isDone, realLoginDone, message: isDone ? '官方已确认登录打卡完成' : '打卡信令已下发' };
   } catch (e) {
     onLog('Sign', `登录打卡异常: ${e.message}`, 'error');
     throw e;

@@ -869,7 +869,8 @@ class CtYunClient {
 
   async login(maxRetries = 1) {
     if (this.loginInfo && !this.account.sessionExpired) {
-      return { success: true, data: this.loginInfo };
+      // 命中内存缓存：未产生任何真实网络登录事件 (fromCache 标记供签到等需要真实登录事件的调用方区分)
+      return { success: true, data: this.loginInfo, fromCache: true };
     }
     // 优先尝试无感静默续期刷新
     if (this.loginInfo) {
@@ -4212,8 +4213,12 @@ function rewardNeedsDesktop(prodId, prodType) {
       if (bindData.code === 0 || bindData.code === 200) {
         acc.bound = true;
         delete acc._smsCodeKey;
+        // 同步会话态：官方已信任本设备，免密凭据 (genLoginToken/tokenLogin) 与静默续期自此恢复可用
+        if (client.loginInfo) {
+          client.loginInfo.bondedDevice = true;
+        }
         saveConfig(appConfig);
-        appendLog('Auth', `[${acc.name}] 恭喜！新设备验证通过，设备码永久信任！`, 'success');
+        appendLog('Auth', `[${acc.name}] 恭喜！新设备验证通过，设备码永久信任！每日签到与静默续期已全面恢复。`, 'success');
         client.startKeepAliveWorker();
         jsonResponse(res, { success: true, message: '设备绑定成功！' });
       } else {
