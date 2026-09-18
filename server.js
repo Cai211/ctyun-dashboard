@@ -822,16 +822,24 @@ class CtYunClient {
     if (!this.loginInfo) {
       throw new Error('账号尚未登录，无法生成登录 Token');
     }
-    const res = await fetchWithTimeout('https://desk.ctyun.cn:8810/api/auth/client/genLoginToken', {
-      method: 'POST',
-      headers: this.getSignedHeaders({ 'Content-Type': 'application/json' }),
-      body: JSON.stringify({ authAppModel: 34, effectiveSeconds })
-    });
-    const json = await res.json();
-    if (json.code === 0 && json.data?.token) {
-      return json.data.token;
+    // 瞬态防护：单次重试 (5 秒间隔)，规避偶发的服务端并发刷新冲突
+    let lastErr = '';
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      const res = await fetchWithTimeout('https://desk.ctyun.cn:8810/api/auth/client/genLoginToken', {
+        method: 'POST',
+        headers: this.getSignedHeaders({ 'Content-Type': 'application/json' }),
+        body: JSON.stringify({ authAppModel: 34, effectiveSeconds })
+      });
+      const json = await res.json();
+      if (json.code === 0 && json.data?.token) {
+        return json.data.token;
+      }
+      lastErr = `${json.msg || '获取免密 Token 失败'} (Code: ${json.code})`;
+      if (attempt < 2) {
+        await new Promise(r => setTimeout(r, 5000));
+      }
     }
-    throw new Error(json.msg || `获取免密 Token 失败 (Code: ${json.code})`);
+    throw new Error(lastErr);
   }
 
   // 无感静默轮转刷新 Token (通过现有会话生成免密票据并重新登录换取全新凭据，彻底杜绝会话失效)
@@ -839,19 +847,20 @@ class CtYunClient {
     if (!this.loginInfo) {
       throw new Error('账号尚未登录，无法续期');
     }
+    const dcMasked = String(this.account.deviceCode || '无').replace(/^(.{10}).*(.{4})$/, '$1****$2');
     let loginToken;
     try {
       loginToken = await this.genLoginToken(300);
     } catch (e) {
-      // 区分失败环节：签发 (genLoginToken) 被拒 = 官方拒绝本会话签发新凭据
-      throw new Error(`签发免密凭据被拒: ${e.message}`);
+      // 环节定位①：签发 (genLoginToken) 被拒 = 官方拒绝本会话签发新免密凭据
+      throw new Error(`签发免密凭据被拒: ${e.message} [设备码: ${dcMasked}, UserId: ${this.loginInfo.userId}]`);
     }
     let newInfo;
     try {
       newInfo = await this.loginByToken(loginToken);
     } catch (e) {
-      // 区分失败环节：消费 (tokenLogin) 被拒 = 凭据与提交设备不匹配 (常见于会话设备与当前设备码不一致)
-      throw new Error(`消费免密凭据被拒: ${e.message}`);
+      // 环节定位②：消费 (tokenLogin) 被拒 = 官方拒绝用该凭据建立新会话
+      throw new Error(`消费免密凭据被拒: ${e.message} [设备码: ${dcMasked}, UserId: ${this.loginInfo.userId}]`);
     }
     this.loginInfo = newInfo;
     this.account.savedLoginInfo = newInfo;
@@ -1144,7 +1153,7 @@ class CtYunClient {
     });
     const json = await res.json();
     if (json.code !== 0 && json.code !== 200) {
-      throw new Error(json.msg || '扫码登录验证失败');
+      throw new Error(`${json.msg || '登录验证失败'} (Code: ${json.code})`);
     }
     this.loginInfo = json.data;
     this.account.savedLoginInfo = json.data;
