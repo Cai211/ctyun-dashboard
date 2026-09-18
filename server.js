@@ -839,8 +839,20 @@ class CtYunClient {
     if (!this.loginInfo) {
       throw new Error('账号尚未登录，无法续期');
     }
-    const loginToken = await this.genLoginToken(300);
-    const newInfo = await this.loginByToken(loginToken);
+    let loginToken;
+    try {
+      loginToken = await this.genLoginToken(300);
+    } catch (e) {
+      // 区分失败环节：签发 (genLoginToken) 被拒 = 官方拒绝本会话签发新凭据
+      throw new Error(`签发免密凭据被拒: ${e.message}`);
+    }
+    let newInfo;
+    try {
+      newInfo = await this.loginByToken(loginToken);
+    } catch (e) {
+      // 区分失败环节：消费 (tokenLogin) 被拒 = 凭据与提交设备不匹配 (常见于会话设备与当前设备码不一致)
+      throw new Error(`消费免密凭据被拒: ${e.message}`);
+    }
     this.loginInfo = newInfo;
     this.account.savedLoginInfo = newInfo;
     this.account.sessionExpired = false;
@@ -1103,15 +1115,19 @@ class CtYunClient {
     };
   }
 
-  // 官方扫码登录 3: 通过 Token 换取正式会话
+  // 官方扫码登录 3: 通过 Token 换取正式登录态
   async loginByToken(accessToken) {
+    // 关键自愈：免密凭据与"签发会话的设备"绑定。若账号当前 deviceCode 与会话签发设备不一致
+    // (常见于长期未重新验证 / 迁移部署 / 重新生成过设备码)，官方将拒绝: "不允许在当前设备使用此凭据"。
+    // 因此优先提交会话自身携带的 deviceCode，保证凭据签发设备与消费设备严格一致。
+    const sessionDeviceCode = this.loginInfo?.deviceCode || this.account.deviceCode;
     const res = await fetchWithTimeout('https://desk.ctyun.cn:8810/api/auth/client/tokenLogin', {
       method: 'POST',
       headers: {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/137.0.0.0',
         'ctg-devicetype': this.deviceType,
         'ctg-version': this.version,
-        'ctg-devicecode': this.account.deviceCode,
+        'ctg-devicecode': sessionDeviceCode,
         'Content-Type': 'application/json'
       },
       body: JSON.stringify({
@@ -1119,7 +1135,7 @@ class CtYunClient {
         osType: 'Windows',
         deviceModel: 'Windows NT 10.0; Win64; x64',
         appVersion: '3.2.0',
-        deviceCode: this.account.deviceCode,
+        deviceCode: sessionDeviceCode,
         deviceName: 'Chrome浏览器',
         deviceType: this.deviceType,
         sysVersion: 'Windows NT 10.0; Win64; x64',
@@ -1134,6 +1150,12 @@ class CtYunClient {
     this.account.savedLoginInfo = json.data;
     this.account.bound = true;
     this.account.sessionExpired = false;
+    // 会话设备码回写对齐：续期成功后账号设备码与会话完全一致，后续轮转永不再错配
+    if (json.data.deviceCode) {
+      this.account.deviceCode = json.data.deviceCode;
+    } else if (this.loginInfo?.deviceCode) {
+      this.account.deviceCode = this.loginInfo.deviceCode;
+    }
     if (json.data.mobilephone) {
       this.account.user = json.data.mobilephone;
     }
