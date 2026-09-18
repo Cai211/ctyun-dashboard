@@ -1665,6 +1665,7 @@ class CtYunClient {
       let sessionTimeout = null;
       let hangCheckInterval = null;
       let wsConnectedAt = 0;
+      let clientPresenceSignal = false; // 官方客户端在席信令 (Type 119/120/137)：收到即代表真机用户接入
 
       const endSession = (reason) => {
         if (cycleDone) return;
@@ -1945,7 +1946,9 @@ class CtYunClient {
             }
 
             if (type === 119 || type === 120 || type === 137) {
-              appendLog('Heartbeat', `[${accName}][${desktopName}] 收到客户端状态通知 (${type})，旁观通道持续待命。`, 'info');
+              // 官方客户端在席信令：真机用户已接入。挂机模式下若随后被断开，据此判定为真实抢占而非网络闪断
+              clientPresenceSignal = true;
+              appendLog('Heartbeat', `[${accName}][${desktopName}] 收到客户端在席信令 (${type})，官方客户端已接入使用。`, 'info');
               return;
             }
           }
@@ -1968,6 +1971,11 @@ class CtYunClient {
           appendLog('Heartbeat', `[${accName}][${desktopName}] 保活长连接正常轮转关闭 (${code} - ${reason || '周期重连'})`, 'info');
         } else if (code >= 4000 || reasonStr.includes('preempt') || reasonStr.includes('kick') || reasonStr.includes('conflict')) {
           appendLog('Heartbeat', `[${accName}][${desktopName}] 收到网关抢占信令 (${code})，确认为官方客户端接入信号。`, 'info');
+          endSession('Preempted by Client');
+          return;
+        } else if (clientPresenceSignal) {
+          // 断开前收到过 Type 119/120/137 在席信令：这是官方客户端接入导致的踢线，绝非网络抖动，绝不盲目重连争抢！
+          appendLog('Heartbeat', `[${accName}][${desktopName}] 断开前收到官方客户端在席信令，判定为真机接入抢占 (状态码: ${code}，已保持 ${heldSec} 秒)。`, 'info');
           endSession('Preempted by Client');
           return;
         } else {
@@ -2060,8 +2068,8 @@ class CtYunClient {
       onLog('Hang', `[${accName}][${targetName}] 🚀 定时挂机任务已启动，正在建立独占会话累加使用时长...`, 'info');
 
       // 5. 执行主挂机长连接 (3600 秒) + 尾差自动补挂循环：确保官方计数真正到达 60/60
-      // 每一轮开始前重新校验避让状态与单机独立开关，与多机独立纳管/客户端避让机制完全兼容：
-      const USER_INTENT_STOP_REASONS = ['User Disabled Task on Active Desktop', 'Yield to External Client', 'Web User Active'];
+      // 每一轮开始前重新校验避让状态与账号/单机开关，与多机独立纳管/客户端避让机制完全兼容：
+      const USER_INTENT_STOP_REASONS = ['User Disabled Task on Active Desktop', 'User Disabled Hang Mode', 'Yield to External Client', 'Web User Active'];
       let attempt = 0;
       let lastResult = null;
       let transientRetries = 0;   // 网络闪断自动重连预算
@@ -2070,6 +2078,11 @@ class CtYunClient {
       while (attempt < MAX_ROUNDS) {
         attempt++;
 
+        // 5.0 账号级挂机总开关实时校验：用户关闭【⏱️ 云电脑挂机1小时】后，任何轮次 (含补挂/闪断重连) 立即终止
+        if (this.account.features?.cloudHang === false) {
+          onLog('Hang', `[${accName}][${targetName}] 账号级【挂机1小时】开关已被用户关闭，挂机${attempt > 1 ? '补挂/重连' : ''}立即终止。`, 'info');
+          break;
+        }
         // 5.1 用户浏览器正在操作云电脑：挂机立即让位终止，绝不反抢
         if (this.isWebUserActive && Date.now() < this.webUserActiveUntil) {
           onLog('Hang', `[${accName}][${targetName}] 浏览器用户正在操作云电脑，挂机${attempt > 1 ? '补挂' : ''}主动让位终止。`, 'info');
