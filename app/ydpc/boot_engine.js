@@ -168,7 +168,10 @@ async function bootYdpcVmUnified(sohoClient, authData, userServiceId, vmInfo = {
     if (errMsg.includes('用完') || errMsg.includes('已用尽') || errMsg.includes('到期')) {
       throw new Error(`当前计费周期时长已用完`);
     }
-    throw new Error(`开机未成功: ${errMsg}`);
+    if (errMsg.includes('选择云电脑类型') || errMsg.includes('7025')) {
+      throw new Error(`中兴ZTE架构云电脑已完成模板激活。因移动云官方架构特性，关机时需在移动云官方App连接一次即可唤醒开机（开机后本系统将持续自动保活）`);
+    }
+    throw new Error(errMsg);
   }
 }
 

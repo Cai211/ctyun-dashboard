@@ -2004,7 +2004,9 @@ async function bootYdpcVm(accId, userServiceId) {
       showToast("✅ " + (data.message || "开机指令已生效！"), "success");
       await loadAccounts(true);
     } else {
-      showToast("开机未成功: " + (data.error || data.msg || "网关拒绝"), "error");
+      const errText = data.error || data.msg || "网关拒绝";
+      const displayErr = errText.startsWith("开机未成功") ? errText : `开机未成功: ${errText}`;
+      showToast(displayErr, "error");
     }
   } catch (e) {
     showToast("请求异常: " + e.message, "error");

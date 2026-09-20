@@ -1130,15 +1130,20 @@ class CtYunClient {
     // (常见于长期未重新验证 / 迁移部署 / 重新生成过设备码)，官方将拒绝: "不允许在当前设备使用此凭据"。
     // 因此优先提交会话自身携带的 deviceCode，保证凭据签发设备与消费设备严格一致。
     const sessionDeviceCode = this.loginInfo?.deviceCode || this.account.deviceCode;
+    const baseHeaders = {
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/137.0.0.0',
+      'ctg-devicetype': this.deviceType,
+      'ctg-version': this.version,
+      'ctg-devicecode': sessionDeviceCode,
+      'Content-Type': 'application/json'
+    };
+    // 核心对齐：若已有会话进行 renewToken 续期，必须使用带会话 Cookie 与签名的 headers，
+    // 否则官方鉴权中心将此请求视为无上下文的裸请求，拒绝消费该免密凭据
+    const reqHeaders = this.loginInfo ? this.getSignedHeaders(baseHeaders) : baseHeaders;
+
     const res = await fetchWithTimeout('https://desk.ctyun.cn:8810/api/auth/client/tokenLogin', {
       method: 'POST',
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/137.0.0.0',
-        'ctg-devicetype': this.deviceType,
-        'ctg-version': this.version,
-        'ctg-devicecode': sessionDeviceCode,
-        'Content-Type': 'application/json'
-      },
+      headers: reqHeaders,
       body: JSON.stringify({
         accessToken,
         osType: 'Windows',

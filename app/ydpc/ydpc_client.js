@@ -163,12 +163,18 @@ class YdpcClient {
     const vms = this.account.vms || [];
     const allOffOrExhausted = vms.length > 0 && vms.every(vm => {
       const isVmOff = String(vm.vmStatus || '').includes('关机') || vm.vmStatusCode === 23 || vm.vmStatusCode === 16;
-      const isLimitedExpired = vm._durationExhausted || (
-        vm.durationMode === 'limited' && (
-          vm.remainHours <= 0 || 
-          (typeof vm.remainDurationTime === 'number' && vm.remainDurationTime <= 0) ||
-          String(vm.remainText || '').includes('0小时') ||
-          String(vm.remainText || '').includes('已耗尽')
+      const isPermanent = vm.durationMode === 'permanent' || String(vm.remainText || '').includes('永久');
+      const isLimitedExpired = !isPermanent && (
+        vm._durationExhausted || (
+          vm.durationMode === 'limited' && (
+            vm.remainHours <= 0 || 
+            (typeof vm.remainDurationTime === 'number' && vm.remainDurationTime <= 0) ||
+            String(vm.remainText || '').includes('0小时') ||
+            String(vm.remainText || '').includes('已耗尽')
+          )
+        ) || (
+          (String(vm.skuName || '').includes('20小时') || String(vm.vmName || '').includes('20小时')) &&
+          (vm.remainHours <= 0 || (typeof vm.remainDurationTime === 'number' && vm.remainDurationTime <= 0) || String(vm.remainText || '').includes('0小时') || String(vm.remainText || '').includes('已耗尽'))
         )
       );
       return isVmOff || isLimitedExpired || vm.keepaliveEnabled === false;
@@ -423,17 +429,20 @@ class YdpcClient {
           const isVmOff = String(vm.vmStatus || '').includes('关机') || vm.vmStatusCode === 23 || vm.vmStatusCode === 16;
           const isSubAccount = this.account.accountType === 'sub';
 
-          const isLimitedExpired = vm._durationExhausted || (
-            vm.durationMode === 'limited' && (
-              vm.remainHours <= 0 || 
-              (typeof vm.remainDurationTime === 'number' && vm.remainDurationTime <= 0) ||
-              String(vm.remainText || '').includes('0小时') ||
-              String(vm.remainText || '').includes('已耗尽') ||
-              String(vm.remainText || '').includes('用完')
+          const isPermanent = vm.durationMode === 'permanent' || String(vm.remainText || '').includes('永久');
+          const isLimitedExpired = !isPermanent && (
+            vm._durationExhausted || (
+              vm.durationMode === 'limited' && (
+                vm.remainHours <= 0 || 
+                (typeof vm.remainDurationTime === 'number' && vm.remainDurationTime <= 0) ||
+                String(vm.remainText || '').includes('0小时') ||
+                String(vm.remainText || '').includes('已耗尽') ||
+                String(vm.remainText || '').includes('用完')
+              )
+            ) || (
+              (String(vm.skuName || '').includes('20小时') || String(vm.vmName || '').includes('20小时')) &&
+              (vm.remainHours <= 0 || (typeof vm.remainDurationTime === 'number' && vm.remainDurationTime <= 0) || String(vm.remainText || '').includes('0小时') || String(vm.remainText || '').includes('已耗尽') || String(vm.remainText || '').includes('用完'))
             )
-          ) || (
-            (String(vm.skuName || '').includes('20小时') || String(vm.vmName || '').includes('20小时') || String(vm.skuName || '').includes('月包')) &&
-            (vm.remainHours <= 0 || (typeof vm.remainDurationTime === 'number' && vm.remainDurationTime <= 0) || String(vm.remainText || '').includes('0小时') || String(vm.remainText || '').includes('已耗尽') || String(vm.remainText || '').includes('用完'))
           );
 
           // 1. 自动开机守护逻辑
@@ -446,14 +455,14 @@ class YdpcClient {
               }
             } else if (isSubAccount || vm._bootRestricted) {
               if (!vm._hasWarnedSub) {
-                this.appendLog('SOHO', `[${accName}][${vm.vmName}] 检测到机器已关机，独立子账号受平台权限限制无法接口拉起，已进入被动守护待命模式`, 'info', accName, 'ydpc');
+                this.appendLog('SOHO', `[${accName}][${vm.vmName}] 检测到机器已关机，受平台架构权限限制无法直接拉起，已进入被动守护待命模式`, 'info', accName, 'ydpc');
                 vm._hasWarnedSub = true;
               }
             } else {
               this.appendLog('SOHO', `[${accName}][${vm.vmName}] 检测到机器已关机，触发【自动开机守护】拉起中...`, 'warning', accName, 'ydpc');
               await this.bootVm(vm.userServiceId).catch(err => {
                 this.appendLog('SOHO', `[${accName}][${vm.vmName}] 自动开机未成功: ${err.message}`, 'warning', accName, 'ydpc');
-                if (err.message?.includes('子账号受限') || err.message?.includes('无权访问') || err.message?.includes('4141')) {
+                if (err.message?.includes('子账号受限') || err.message?.includes('无权访问') || err.message?.includes('4141') || err.message?.includes('选择云电脑类型') || err.message?.includes('7025') || err.message?.includes('中兴ZTE云电脑已完成激活')) {
                   vm._bootRestricted = true;
                 }
               });
