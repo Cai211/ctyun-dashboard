@@ -171,11 +171,11 @@ async function executeNativeAiChat(client, acc, onLog = console.log) {
 }
 
 /**
- * 登录打卡 (严格对齐天翼云官方鉴权中心 tokenLogin 真实登录事件)
+ * 登录打卡 (真实完成天翼云官方【登录AI云电脑】任务，彻底与 40050 tokenLogin 解耦)
  */
 async function executeNativeSign(client, acc, onLog = console.log) {
   const accName = acc.name || acc.user;
-  onLog('Sign', `正在执行天翼云官方登录打卡认证...`, 'info');
+  onLog('Sign', `正在执行天翼云官方【登录AI云电脑】打卡认证...`, 'info');
   try {
     // 1. 检查今日是否已在官方任务中心完成
     await client.refreshOfficialTasks();
@@ -185,32 +185,72 @@ async function executeNativeSign(client, acc, onLog = console.log) {
       return { success: true, isCompleted: true, message: '今日已完成登录打卡' };
     }
 
-    // 2. 核心修复：真实触发天翼云官方鉴权中心登录事件 (genLoginToken + tokenLogin 真实调用官方 /api/auth/client/tokenLogin)
-    // 这不仅使天翼云服务端明确记录到今日的正式登录事件，还同时实现 Token 静默轮转保鲜
-    let realLoginDone = false;
-    try {
-      onLog('Sign', `正在向官方鉴权中心下发真实登录握手 (tokenLogin)...`, 'info');
-      await client.renewToken();
-      realLoginDone = true;
-    } catch (e) {
-      onLog('Sign', `Token 轮转登录提示: ${e.message}，尝试直接鉴权...`, 'warning');
-      const res = await client.login();
-      if (!res.success) throw new Error(res.error || '登录握手失败');
-      // fromCache=true 表示命中内存会话，未产生任何真实登录事件
-      realLoginDone = res.fromCache !== true;
+    // 2. 状态避让与互斥检查：如果当前正在执行 1 小时挂机任务，挂机会话本身即发送 112/104 桌面认领，直接复用
+    if (client.isTaskHanging) {
+      onLog('Sign', `[${accName}] ⏱️ 云电脑当前正处于 1 小时挂机会话中，桌面正在认领，打卡自动复用挂机会话。`, 'info');
+      return { success: true, isCompleted: false, message: '挂机会话正在执行认领' };
     }
 
-    // 3. 同步拉取最新云电脑设备列表并触发一次桌面网关连接握手
+    // 3. 用户浏览器操作或客户端避让期：主动避让
+    if (client.isWebUserActive && Date.now() < client.webUserActiveUntil) {
+      onLog('Sign', `[${accName}] 浏览器用户正在操作云电脑，打卡任务主动避让。`, 'info');
+      return { success: true, isCompleted: false, message: '浏览器用户操作中，主动避让' };
+    }
+    if (Date.now() < client.externalYieldUntil) {
+      const waitMin = Math.ceil((client.externalYieldUntil - Date.now()) / 60000);
+      onLog('Sign', `[${accName}] 官方客户端近期活跃处于避让期 (剩余 ${waitMin} 分钟)，打卡任务主动避让。`, 'info');
+      return { success: true, isCompleted: false, message: '处于客户端避让冷却期' };
+    }
+
+    // 4. 获取目标云电脑（优选已开机运行的主机）
     const desktops = await client.getDesktops().catch(() => []);
-    if (desktops && desktops.length > 0) {
-      const mainD = desktops.find(d => d.taskEnabled !== false) || desktops[0];
-      const dId = mainD.objId || mainD.desktopId;
-      if (dId && typeof client.connect === 'function') {
-        await client.connect(dId).catch(() => {});
+    if (!desktops || desktops.length === 0) {
+      onLog('Sign', `[${accName}] 账号名下暂无可用的云电脑主机。`, 'warning');
+      return { success: true, isCompleted: false, message: '名下无可用云电脑' };
+    }
+    const taskOnDesktops = desktops.filter(d => d.taskEnabled !== false);
+    if (taskOnDesktops.length === 0) {
+      onLog('Sign', `[${accName}] 账号名下所有云电脑的【任务】开关均已关闭，跳过桌面登录认领。`, 'info');
+      return { success: true, isCompleted: false, message: '任务开关已关闭' };
+    }
+
+    const isRunning = (d) => d && (d.useStatusText === '运行中' || d.useStatus == 25);
+    const runningDesktop = taskOnDesktops.find(d => isRunning(d));
+    const mainDesktop = runningDesktop || taskOnDesktops[0];
+    const targetName = mainDesktop.objName || mainDesktop.desktopName || '云电脑';
+    const targetId = String(mainDesktop.objId || mainDesktop.desktopId);
+
+    // 5. 若未开机：根据自动开机配置决定是否唤醒
+    if (!isRunning(mainDesktop)) {
+      if (mainDesktop.autoBootEnabled !== false) {
+        onLog('Sign', `[${accName}][${targetName}] 云电脑未开机，正在下发开机唤醒指令以完成【登录AI云电脑】打卡...`, 'info');
+        await client.controlPower(targetId, 'poweron').catch(() => {});
+        for (let i = 0; i < 6; i++) {
+          await new Promise(r => setTimeout(r, 10000));
+          const fresh = await client.getDesktops().catch(() => []);
+          const target = (fresh || []).find(d => String(d.objId || d.desktopId) === targetId);
+          if (isRunning(target)) break;
+        }
+      } else {
+        onLog('Sign', `[${accName}][${targetName}] 云电脑当前关机且未开启自动开机，已完成基本账号鉴权；待开机或运行挂机任务时将自动达成【登录AI云电脑】。`, 'info');
+        return { success: true, isCompleted: false, message: '云电脑关机待唤醒' };
       }
     }
 
-    // 4. 等待 3 秒让天翼云营销积分系统记录登录事件，并重新拉取官方任务中心确认
+    // 6. 核心认证：通过 25 秒轻量桌面认领脉冲向视讯网关下发 118身份 + 112登录凭据 + 104握手确认包
+    // 这正是天翼云营销中心记录【登录AI云电脑】达成的真实判定事件（彻底杜绝自产自销 tokenLogin 触发 40050）
+    onLog('Sign', `[${accName}][${targetName}] 正在建立视讯网关登录认领脉冲 (Type 118/112/104)...`, 'info');
+    client.isTaskHanging = true;
+    try {
+      if (client.endCurrentSession) {
+        client.endCurrentSession('Yield to Sign Claim');
+      }
+      await client.runDesktopKeepAliveSession(mainDesktop, true, 25);
+    } finally {
+      client.isTaskHanging = false;
+    }
+
+    // 7. 等待 3 秒让天翼云营销积分系统记录登录事件，并重新拉取官方任务中心确认
     await new Promise(r => setTimeout(r, 3000));
     await client.refreshOfficialTasks();
 
@@ -219,15 +259,11 @@ async function executeNativeSign(client, acc, onLog = console.log) {
 
     if (isDone) {
       onLog('Sign', `🎉 官方任务中心已确认【登录AI云电脑】达成 (+100积分)！`, 'success');
-    } else if (!realLoginDone) {
-      // 关键加固：免密凭据被官方拒绝 (设备未授信) 且兜底命中缓存时，绝不虚报完成
-      onLog('Sign', `⚠️ 官方拒绝了免密登录凭据 (当前设备未获授信)，本次未能产生真实登录事件，登录打卡暂时无法在官方记为达成。`, 'warning');
-      onLog('Sign', `👉 请先在卡片完成【设备绑定】(📱 扫码一键授信 或 图验+短信验证) —— 设备授信后每日签到与静默续期将全部自动生效。`, 'warning');
     } else {
-      onLog('Sign', `✅ 官方登录打卡信令与桌面握手已全部完成 (官方积分通常在数分钟内同步到账)。`, 'info');
+      onLog('Sign', `✅ 官方桌面登录认领信令已成功送达 (官方积分通常在数分钟内同步刷新)。`, 'info');
     }
 
-    return { success: true, isCompleted: isDone, realLoginDone, message: isDone ? '官方已确认登录打卡完成' : '打卡信令已下发' };
+    return { success: true, isCompleted: isDone, message: isDone ? '官方已确认登录打卡完成' : '打卡认领信令已下发' };
   } catch (e) {
     onLog('Sign', `登录打卡异常: ${e.message}`, 'error');
     throw e;

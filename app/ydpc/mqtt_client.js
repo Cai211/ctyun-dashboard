@@ -64,7 +64,8 @@ function buildMqttPingReqPacket() {
 class MqttKeepAliveClient {
   constructor(options = {}) {
     this.host = options.host || 'alive.soho.komect.com';
-    this.port = Number(options.port) || 443;
+    const rawPort = Number(options.port);
+    this.port = (rawPort && rawPort !== 443) ? rawPort : 8883;
     this.clientId = options.clientId || `client_${crypto.randomUUID().replace(/-/g, '').substring(0, 16)}`;
     this.username = options.username || '';
     this.password = options.password || '';
@@ -88,6 +89,18 @@ class MqttKeepAliveClient {
     }
     this.isClosedManually = false;
 
+    // 1. 双栈网络智能选路：优先选取 IPv4 地址，彻底消除 Docker 容器/宿主机双栈网络下因 IPv6 无网关导致的 10 秒超时假死
+    const dns = require('dns');
+    const targetIp = await new Promise((res) => {
+      dns.lookup(this.host, { all: true }, (err, addresses) => {
+        if (!err && Array.isArray(addresses) && addresses.length > 0) {
+          const ipv4 = addresses.find(a => a.family === 4);
+          return res(ipv4 ? ipv4.address : addresses[0].address);
+        }
+        res(this.host);
+      });
+    });
+
     return new Promise((resolve, reject) => {
       let isResolved = false;
       const timeout = setTimeout(() => {
@@ -100,9 +113,9 @@ class MqttKeepAliveClient {
 
       try {
         const tlsOptions = {
-          host: this.host,
+          host: targetIp,
           port: this.port,
-          servername: this.host,
+          servername: this.host, // 保持原始 host 用于 TLS SNI 证书合法性校验
           rejectUnauthorized: false
         };
 

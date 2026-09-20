@@ -461,24 +461,36 @@ function buildOfficialTasksHtml(m) {
   return `<div style="font-size: 12px; color: var(--text-muted); text-align: center; padding: 6px 0;">正在同步天翼云官方任务中心数据...</div>`;
 }
 
-// 计算单账号多机周期的综合概览展示文本
+// 计算单账号多机周期的综合概览展示文本 (支持单机差异化周期精准动态呈现)
 function buildIntervalOverviewText(acc) {
   const isYdpc = acc.platform === 'ydpc';
   const defaultIntervalSec = parseInt(acc.keepaliveInterval || acc.pulseIntervalSeconds) || (isYdpc ? 600 : 30);
   const items = isYdpc ? (acc.vms || []) : (acc.desktops || []);
   
-  if (items.length > 1) {
-    const customItems = items.filter(it => it.keepaliveInterval && parseInt(it.keepaliveInterval) !== defaultIntervalSec);
-    if (customItems.length > 0) {
-      const parts = items.map(it => {
-        const sec = parseInt(it.keepaliveInterval) || defaultIntervalSec;
-        const rawName = String(it.vmName || it.desktopName || '主机');
-        const shortName = rawName.slice(0, 3);
-        return `${shortName} ${isYdpc ? Math.round(sec / 60) + '分' : sec + 's'}`;
-      });
-      return `多机独立 (${parts.join(' · ')})`;
-    }
+  // 1. 若仅有 1 台云电脑，直接精准展示该主机的实际生效周期
+  if (items.length === 1) {
+    const singleSec = parseInt(items[0].keepaliveInterval) || defaultIntervalSec;
+    return isYdpc ? `${Math.round(singleSec / 60)} 分钟` : `${singleSec}s`;
   }
+
+  // 2. 若有多台云电脑
+  if (items.length > 1) {
+    const itemIntervals = items.map(it => parseInt(it.keepaliveInterval) || defaultIntervalSec);
+    const allSame = itemIntervals.every(v => v === itemIntervals[0]);
+    // 若多台云电脑设置的周期全部相同，直接统一展示该周期
+    if (allSame) {
+      return isYdpc ? `${Math.round(itemIntervals[0] / 60)} 分钟` : `${itemIntervals[0]}s`;
+    }
+    // 周期各不相同时，展示多机独立详情
+    const parts = items.map(it => {
+      const sec = parseInt(it.keepaliveInterval) || defaultIntervalSec;
+      const rawName = String(it.vmName || it.desktopName || '主机');
+      const shortName = rawName.slice(0, 4);
+      return `${shortName} ${isYdpc ? Math.round(sec / 60) + '分' : sec + 's'}`;
+    });
+    return `多机独立 (${parts.join(' · ')})`;
+  }
+
   return isYdpc ? `${Math.round(defaultIntervalSec / 60)} 分钟` : `${defaultIntervalSec}s`;
 }
 
@@ -3014,6 +3026,9 @@ async function openUserNotifyModal() {
     if (document.getElementById("user-notify-token")) {
       document.getElementById("user-notify-token").value = notify.webhookUrl || "";
     }
+    if (document.getElementById("user-notify-secret")) {
+      document.getElementById("user-notify-secret").value = notify.secret || "";
+    }
     if (document.getElementById("user-notify-title-tpl")) {
       document.getElementById("user-notify-title-tpl").value = notify.customTitleTemplate || "";
     }
@@ -3031,10 +3046,31 @@ function onUserNotifyChannelChange(isUserSwitch = true) {
   const channelEl = document.getElementById("user-notify-channel");
   const label = document.getElementById("user-notify-token-label");
   const input = document.getElementById("user-notify-token");
+  const secretGroup = document.getElementById("group-user-notify-secret");
+  const secretInput = document.getElementById("user-notify-secret");
+  const secretHint = document.getElementById("user-notify-secret-hint");
   if (!channelEl || !label || !input) return;
 
   const channel = channelEl.value;
   const currentVal = input.value.trim();
+
+  // 控制加签密钥输入框的显隐
+  if (secretGroup) {
+    if (channel === "dingtalk" || channel === "feishu") {
+      secretGroup.classList.remove("hidden");
+      if (channel === "dingtalk") {
+        document.getElementById("user-notify-secret-label").innerText = "钉钉机器人加签密钥 (Secret / 选填)";
+        secretInput && (secretInput.placeholder = "例如 SECxxxxxxxx (如未开启加签请留空)");
+        secretHint && (secretHint.innerText = "若机器人在钉钉中开启了【加签】安全设置，请填写以 SEC 开头的密钥；若仅使用关键词请留空。");
+      } else {
+        document.getElementById("user-notify-secret-label").innerText = "飞书机器人签名密钥 (Secret / 选填)";
+        secretInput && (secretInput.placeholder = "例如 vQoxxxxxxxxx (如未开启签名校验请留空)");
+        secretHint && (secretHint.innerText = "若飞书机器人在安全设置中开启了【签名校验】，请在此填写密钥；如未开启请留空。");
+      }
+    } else {
+      secretGroup.classList.add("hidden");
+    }
+  }
 
   // 若用户主动在下拉列表中切换通道类型，且当前输入框中残留了其他通道的特征链接，自动清空避免跨渠道残留
   if (isUserSwitch && currentVal) {
@@ -3048,6 +3084,7 @@ function onUserNotifyChannelChange(isUserSwitch = true) {
       (channel !== "telegram" && currentVal.includes("api.telegram.org"));
     if (isOtherChannelUrl) {
       input.value = "";
+      if (secretInput) secretInput.value = "";
     }
   }
 
@@ -3055,7 +3092,7 @@ function onUserNotifyChannelChange(isUserSwitch = true) {
     label.innerText = "企业微信机器人 Webhook 地址";
     input.placeholder = "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=xxxx";
   } else if (channel === "dingtalk") {
-    label.innerText = "钉钉机器人 Webhook 地址";
+    label.innerText = "钉钉机器人 Webhook 地址 (或仅输入 Token)";
     input.placeholder = "https://oapi.dingtalk.com/robot/send?access_token=xxxx";
   } else if (channel === "feishu") {
     label.innerText = "飞书机器人 Webhook 地址";
@@ -3081,6 +3118,7 @@ function onUserNotifyChannelChange(isUserSwitch = true) {
 async function testUserNotify() {
   const channel = document.getElementById("user-notify-channel") ? document.getElementById("user-notify-channel").value : "webhook";
   const webhookUrl = document.getElementById("user-notify-token") ? document.getElementById("user-notify-token").value.trim() : "";
+  const secret = document.getElementById("user-notify-secret") ? document.getElementById("user-notify-secret").value.trim() : "";
   const customTitleTemplate = document.getElementById("user-notify-title-tpl") ? document.getElementById("user-notify-title-tpl").value.trim() : "";
   const customContentTemplate = document.getElementById("user-notify-content-tpl") ? document.getElementById("user-notify-content-tpl").value.trim() : "";
 
@@ -3094,7 +3132,7 @@ async function testUserNotify() {
     const res = await authFetch("/api/user/notify/test", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ channel, webhookUrl, customTitleTemplate, customContentTemplate })
+      body: JSON.stringify({ channel, webhookUrl, secret, customTitleTemplate, customContentTemplate })
     });
     const data = await res.json();
     if (res.ok && data.success) {
@@ -3112,6 +3150,7 @@ async function saveUserNotify() {
     enabled: document.getElementById("user-notify-enabled") ? document.getElementById("user-notify-enabled").checked : false,
     channel: document.getElementById("user-notify-channel") ? document.getElementById("user-notify-channel").value : "webhook",
     webhookUrl: document.getElementById("user-notify-token") ? document.getElementById("user-notify-token").value.trim() : "",
+    secret: document.getElementById("user-notify-secret") ? document.getElementById("user-notify-secret").value.trim() : "",
     customTitleTemplate: document.getElementById("user-notify-title-tpl") ? document.getElementById("user-notify-title-tpl").value.trim() : "",
     customContentTemplate: document.getElementById("user-notify-content-tpl") ? document.getElementById("user-notify-content-tpl").value.trim() : ""
   };

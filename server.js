@@ -4,6 +4,13 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 const net = require('net');
+const dns = require('dns');
+
+// 全局优先使用 IPv4，彻底根治 Docker 容器及宿主机双栈网络下因 IPv6 无外网网关导致的 10 秒超时假死
+if (typeof dns.setDefaultResultOrder === 'function') {
+  dns.setDefaultResultOrder('ipv4first');
+}
+
 const WebSocket = require('ws');
 const CtYunEncryption = require('./app/ctyun_encryption');
 const { executeNativeAiChat, executeNativeSign, executeNativeHang } = require('./app/tasks/native_tasks');
@@ -237,9 +244,16 @@ function isValidWebhookTarget(channel, rawTarget) {
     return /^[\w\-:]+@[\w\-]+$/.test(target);
   }
 
+  // 钉钉支持输入纯 access_token (32~128位字符)
+  if (ch === 'dingtalk' && /^[a-zA-Z0-9_\-]{32,128}$/.test(target)) {
+    return true;
+  }
+
   // URL 型推送渠道 (webhook, qywx, dingtalk, feishu, bark)
   try {
-    const u = new URL(target);
+    // 剥离可能附带的 @SEC... 密钥后缀以供 URL 校验
+    const checkUrl = target.split('@SEC')[0].trim();
+    const u = new URL(checkUrl);
     if (u.protocol !== 'http:' && u.protocol !== 'https:') return false;
     if (isPrivateIpOrHost(u.hostname)) return false;
     return true;
@@ -317,23 +331,79 @@ async function sendNotification(settings, title, content, extraVars = {}) {
       const qywxData = await res.json().catch(() => ({}));
       return { success: res.ok && qywxData.errcode === 0, message: qywxData.errmsg || `HTTP ${res.status}` };
     } else if (channel === 'dingtalk' && notify.webhookUrl) {
-      // 钉钉自定义机器人 Webhook (支持 markdown 格式)
+      let dingUrl = notify.webhookUrl.trim();
+      let dingSecret = (notify.secret || '').trim();
+
+      // 1. 如果用户输入的是纯 access_token，自动补全官方 Webhook 基础前缀
+      if (/^[a-zA-Z0-9_\-]{32,128}$/.test(dingUrl)) {
+        dingUrl = `https://oapi.dingtalk.com/robot/send?access_token=${dingUrl}`;
+      }
+
+      // 2. 支持从 URL 中智能提取加签密钥: 如 https://oapi.dingtalk.com/robot/send?access_token=xxx&secret=SECxxx 或 url@SECxxx
+      if (dingUrl.includes('@SEC')) {
+        const parts = dingUrl.split('@');
+        dingUrl = parts[0].trim();
+        dingSecret = dingSecret || parts[1].trim();
+      } else if (dingUrl.includes('secret=')) {
+        try {
+          const u = new URL(dingUrl);
+          const s = u.searchParams.get('secret');
+          if (s) {
+            dingSecret = dingSecret || s;
+            u.searchParams.delete('secret');
+            dingUrl = u.toString();
+          }
+        } catch (e) {}
+      }
+
+      // 3. 如果开启或提供了加签密钥 (SEC...)，严格按照钉钉官方标准计算 HmacSHA256 签名并追加到 URL
+      if (dingSecret) {
+        const timestamp = Date.now();
+        const stringToSign = `${timestamp}\n${dingSecret}`;
+        const sign = crypto.createHmac('sha256', dingSecret).update(stringToSign).digest('base64');
+        const sep = dingUrl.includes('?') ? '&' : '?';
+        dingUrl = `${dingUrl}${sep}timestamp=${timestamp}&sign=${encodeURIComponent(sign)}`;
+      }
+
+      // 4. 钉钉 Markdown 负载 (首屏 title 必须为纯文本，剔除特殊字符)
+      const cleanTitle = finalTitle.replace(/[#*`_~\[\]()]/g, '').trim() || '云电脑通知';
       const dingPayload = {
         msgtype: 'markdown',
         markdown: {
-          title: finalTitle,
+          title: cleanTitle,
           text: `### ${finalTitle}\n\n${finalContent}\n\n> 触发时间: ${vars['{time}']}`
         }
       };
-      const res = await fetch(notify.webhookUrl, {
+      const res = await fetch(dingUrl, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(dingPayload)
       });
       const dingData = await res.json().catch(() => ({}));
-      return { success: res.ok && dingData.errcode === 0, message: dingData.errmsg || `HTTP ${res.status}` };
+      let errMsg = dingData.errmsg || `HTTP ${res.status}`;
+      if (dingData.errcode === 310000) {
+        if (errMsg.includes('sign not match')) {
+          errMsg = '【加签校验失败】您的钉钉机器人开启了加签安全设置，请在设置中填写以 SEC 开头的加签密钥 (Secret)！';
+        } else if (errMsg.includes('keywords not in content')) {
+          errMsg = '【关键词不匹配】您的钉钉机器人设置了自定义关键词，通知内容中必须包含您在钉钉设定的关键词！';
+        } else if (errMsg.includes('IP')) {
+          errMsg = '【IP未在白名单】您的钉钉机器人设置了IP白名单，当前服务器IP未在白名单中！';
+        }
+      } else if (dingData.errcode === 300001) {
+        errMsg = '【Token无效】钉钉 access_token 无效或机器人已被删除，请核对 Webhook 地址！';
+      }
+      return { success: res.ok && dingData.errcode === 0, message: errMsg };
     } else if (channel === 'feishu' && notify.webhookUrl) {
-      // 飞书自定义机器人 Webhook (支持 interactive 交互富文本卡片)
+      let feishuUrl = notify.webhookUrl.trim();
+      let feishuSecret = (notify.secret || '').trim();
+
+      // 支持从 URL 提取 secret: url@secret
+      if (feishuUrl.includes('@')) {
+        const parts = feishuUrl.split('@');
+        feishuUrl = parts[0].trim();
+        feishuSecret = feishuSecret || parts[1].trim();
+      }
+
       const feishuPayload = {
         msg_type: 'interactive',
         card: {
@@ -355,6 +425,14 @@ async function sendNotification(settings, title, content, extraVars = {}) {
           ]
         }
       };
+
+      if (feishuSecret) {
+        const timestamp = Math.floor(Date.now() / 1000).toString();
+        const stringToSign = `${timestamp}\n${feishuSecret}`;
+        const sign = crypto.createHmac('sha256', stringToSign).update('').digest('base64');
+        feishuPayload.timestamp = timestamp;
+        feishuPayload.sign = sign;
+      }
       const res = await fetch(notify.webhookUrl, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -429,21 +507,62 @@ async function sendAccountNotification(account, title, content, extraVars = {}) 
   }
 }
 
-// AES-256-GCM 密码强加密与安全落盘
+// 双平台通用原子文件写入函数 (防断电/防崩溃截断：先写临时文件再原子重命名替换)
+function atomicWriteFileSync(filePath, content, encoding = 'utf8', mode = undefined) {
+  const dir = path.dirname(filePath);
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+  const tmpPath = path.join(dir, `.${path.basename(filePath)}.tmp.${Date.now()}.${Math.random().toString(36).slice(2, 7)}`);
+  const opts = mode ? { encoding, mode } : { encoding };
+  fs.writeFileSync(tmpPath, content, opts);
+  try {
+    try {
+      fs.renameSync(tmpPath, filePath);
+    } catch (renameErr) {
+      // Windows 平台在文件占用瞬间 renameSync 可能抛 EPERM，回退为 copyFileSync 替换后清理临时文件
+      fs.copyFileSync(tmpPath, filePath);
+      try { fs.unlinkSync(tmpPath); } catch (e) {}
+    }
+  } catch (err) {
+    try { if (fs.existsSync(tmpPath)) fs.unlinkSync(tmpPath); } catch (e) {}
+    throw err;
+  }
+}
+
+// AES-256-GCM 密码强加密与安全落盘 (支持主密钥与备份密钥双重容灾互保)
 const MASTER_KEY_FILE = path.join(DATA_DIR, '.master.key');
+const MASTER_KEY_BAK_FILE = path.join(DATA_DIR, '.master.key.bak');
 
 function getOrCreateMasterKey() {
+  // 1. 优先从主密钥文件读取
   if (fs.existsSync(MASTER_KEY_FILE)) {
     try {
       const raw = fs.readFileSync(MASTER_KEY_FILE, 'utf8').trim();
       if (raw.length === 64) {
+        // 同步刷新备份密钥
+        try { atomicWriteFileSync(MASTER_KEY_BAK_FILE, raw, 'utf8', 0o600); } catch (e) {}
         return Buffer.from(raw, 'hex');
       }
     } catch (e) {}
   }
+
+  // 2. 主密钥损坏或丢失时，自动从备份密钥恢复
+  if (fs.existsSync(MASTER_KEY_BAK_FILE)) {
+    try {
+      const raw = fs.readFileSync(MASTER_KEY_BAK_FILE, 'utf8').trim();
+      if (raw.length === 64) {
+        try { atomicWriteFileSync(MASTER_KEY_FILE, raw, 'utf8', 0o600); } catch (e) {}
+        console.log('🛡️ [安全自愈] 主密钥文件异常，已成功从备份密钥 (.master.key.bak) 恢复！');
+        return Buffer.from(raw, 'hex');
+      }
+    } catch (e) {}
+  }
+
+  // 3. 首次全新初始化：生成 32 字节主密钥并双写持久化
   const newKey = crypto.randomBytes(32);
+  const hexKey = newKey.toString('hex');
   try {
-    fs.writeFileSync(MASTER_KEY_FILE, newKey.toString('hex'), { mode: 0o600 });
+    atomicWriteFileSync(MASTER_KEY_FILE, hexKey, 'utf8', 0o600);
+    atomicWriteFileSync(MASTER_KEY_BAK_FILE, hexKey, 'utf8', 0o600);
   } catch (e) {}
   return newKey;
 }
@@ -515,36 +634,92 @@ function getDefaultConfig() {
 }
 
 function loadConfig() {
+  const BAK_FILE = CONFIG_FILE + '.bak';
+  let cfg = null;
+  let loadedFromBak = false;
+
+  // 1. 尝试从主配置文件加载
   if (fs.existsSync(CONFIG_FILE)) {
     try {
-      const content = fs.readFileSync(CONFIG_FILE, 'utf8');
-      const cfg = JSON.parse(content);
-      const defaultSettings = getDefaultConfig().settings;
-      if (!cfg.settings) {
-        cfg.settings = defaultSettings;
+      const content = fs.readFileSync(CONFIG_FILE, 'utf8').trim();
+      if (content) {
+        cfg = JSON.parse(content);
       } else {
-        cfg.settings = { ...defaultSettings, ...cfg.settings };
+        console.warn('⚠️ [配置检查] 主配置文件 app_config.json 为空 (0 字节)');
       }
-      if (!cfg.accounts) cfg.accounts = [];
-      if (!cfg.users) cfg.users = [];
-      // 兼容历史版本：将 settings.notify 自动无损同步至 admin 账号作为其私有通知，保证已有配置不丢失
-      if (cfg.settings?.notify && cfg.settings.notify.enabled) {
-        const adminUser = cfg.users.find(u => u.username === 'admin' || u.role === 'admin');
-        if (adminUser && !adminUser.notify) {
-          adminUser.notify = { ...cfg.settings.notify };
-        }
-      }
-      // 默认已有账号归属 admin，默认平台为 ctyun，并解密密码还原至内存
-      cfg.accounts.forEach(a => {
-        if (!a.ownerId) a.ownerId = 'u_admin';
-        if (!a.platform) a.platform = 'ctyun';
-        if (a.password) a.password = decryptPassword(a.password);
-      });
-      return cfg;
     } catch (e) {
-      console.error('读取配置失败:', e);
+      console.error('⚠️ [配置损坏] 主配置文件 app_config.json 解析失败:', e.message);
+      // 保护现场：绝不直接销毁损坏文件！
+      try {
+        const corruptBak = path.join(DATA_DIR, `app_config.corrupt.${Date.now()}.json`);
+        fs.copyFileSync(CONFIG_FILE, corruptBak);
+        console.warn(`⚠️ [安全保护] 已将损坏的配置现场安全备份至: ${corruptBak}`);
+      } catch (err) {}
     }
   }
+
+  // 2. 如果主配置损坏、为空或关键数据结构缺失，尝试从自动备份文件 .bak 恢复！
+  if ((!cfg || (!Array.isArray(cfg.users) && !Array.isArray(cfg.accounts))) && fs.existsSync(BAK_FILE)) {
+    try {
+      const bakContent = fs.readFileSync(BAK_FILE, 'utf8').trim();
+      if (bakContent) {
+        const bakCfg = JSON.parse(bakContent);
+        if (bakCfg && (Array.isArray(bakCfg.users) || Array.isArray(bakCfg.accounts))) {
+          cfg = bakCfg;
+          loadedFromBak = true;
+          console.log('🛡️ [容灾自愈] 检测到主配置异常，已成功从自动备份文件 (app_config.json.bak) 完美恢复全量配置！');
+        }
+      }
+    } catch (e) {
+      console.error('读取备份配置文件失败:', e);
+    }
+  }
+
+  // 3. 如果成功获取到配置 (无论是主配置还是备份恢复)
+  if (cfg && (cfg.settings || cfg.accounts || cfg.users)) {
+    const defaultSettings = getDefaultConfig().settings;
+    if (!cfg.settings) {
+      cfg.settings = defaultSettings;
+    } else {
+      cfg.settings = { ...defaultSettings, ...cfg.settings };
+    }
+    if (!Array.isArray(cfg.accounts)) cfg.accounts = [];
+    if (!Array.isArray(cfg.users)) cfg.users = [];
+
+    // 兼容历史版本：将 settings.notify 自动无损同步至 admin 账号作为其私有通知，保证已有配置不丢失
+    if (cfg.settings?.notify && cfg.settings.notify.enabled) {
+      const adminUser = cfg.users.find(u => u.username === 'admin' || u.role === 'admin');
+      if (adminUser && !adminUser.notify) {
+        adminUser.notify = { ...cfg.settings.notify };
+      }
+    }
+    // 默认已有账号归属 admin，默认平台为 ctyun，并解密密码还原至内存
+    cfg.accounts.forEach(a => {
+      if (!a.ownerId) a.ownerId = 'u_admin';
+      if (!a.platform) a.platform = 'ctyun';
+      if (a.password) a.password = decryptPassword(a.password);
+    });
+
+    // 如果是从备份恢复的，立即原子回写主配置文件修复现场
+    if (loadedFromBak) {
+      saveConfig(cfg);
+    } else {
+      // 主配置正常，原子同步刷新备份文件
+      try {
+        const diskClone = JSON.parse(JSON.stringify(cfg));
+        if (Array.isArray(diskClone.accounts)) {
+          for (const a of diskClone.accounts) {
+            if (a.password) a.password = encryptPassword(a.password);
+          }
+        }
+        atomicWriteFileSync(BAK_FILE, JSON.stringify(diskClone, null, 2), 'utf8');
+      } catch (e) {}
+    }
+    return cfg;
+  }
+
+  // 4. 只有在首次全新安装时（既无主配置，也无备份），才初始化默认配置
+  console.log('ℹ️ [系统初始化] 未检测到已有配置文件，正在初始化全新运行环境...');
   const defaultCfg = getDefaultConfig();
   saveConfig(defaultCfg);
   return defaultCfg;
@@ -564,9 +739,19 @@ function saveConfig(cfg) {
       }
     }
 
-    fs.writeFileSync(CONFIG_FILE, JSON.stringify(diskClone, null, 2), 'utf8');
+    const jsonStr = JSON.stringify(diskClone, null, 2);
+    // 1. 原子写入主配置文件 (防崩溃/防断电截断)
+    atomicWriteFileSync(CONFIG_FILE, jsonStr, 'utf8');
 
-    // accounts.json 同样加密保护
+    // 2. 自动同步持久化备份文件 (app_config.json.bak)
+    if (Array.isArray(diskClone.accounts) || Array.isArray(diskClone.users)) {
+      try {
+        const BAK_FILE = CONFIG_FILE + '.bak';
+        atomicWriteFileSync(BAK_FILE, jsonStr, 'utf8');
+      } catch (e) {}
+    }
+
+    // 3. accounts.json 同样加密保护并原子写入
     const active = (configToSave.accounts || [])
       .filter(a => a.enabled !== false && a.features?.keepAlive !== false)
       .map(a => ({
@@ -579,7 +764,7 @@ function saveConfig(cfg) {
       keepAliveSeconds: configToSave.settings?.keepAliveSeconds || 60,
       accounts: active
     };
-    fs.writeFileSync(ACCOUNTS_JSON, JSON.stringify(ctyunJson, null, 2), 'utf8');
+    atomicWriteFileSync(ACCOUNTS_JSON, JSON.stringify(ctyunJson, null, 2), 'utf8');
     return true;
   } catch (e) {
     console.error('保存配置失败:', e);
@@ -1739,8 +1924,9 @@ class CtYunClient {
       };
 
       if (isHangMode) {
-        // 挂机会话时长：主挂机 3600 秒，尾差补挂按传入轮次时长 (上限 3600 秒)
-        const maxHangTimeout = Math.min(3600, Math.max(60, parseInt(pulseConnectSec) || 3600));
+        // 挂机会话时长：主挂机 3600 秒，尾差补挂按传入轮次时长 (上限 3600 秒)；轻量认领脉冲 (如打卡 <=30秒) 允许精准按传入时长执行 (下限 15 秒)
+        const minSec = pulseConnectSec <= 30 ? Math.max(15, pulseConnectSec) : 60;
+        const maxHangTimeout = Math.min(3600, Math.max(minSec, parseInt(pulseConnectSec) || 3600));
         this.metrics.keepAliveSeconds = maxHangTimeout;
         this.metrics.cycleCountdown = maxHangTimeout;
         sessionTimeout = setTimeout(() => {
@@ -4992,6 +5178,7 @@ function rewardNeedsDesktop(prodId, prodType) {
         enabled: true,
         channel: channel,
         webhookUrl: testUrl,
+        secret: body.secret || '',
         customTitleTemplate: body.customTitleTemplate || '',
         customContentTemplate: body.customContentTemplate || ''
       }
@@ -5299,9 +5486,21 @@ function rewardNeedsDesktop(prodId, prodType) {
 });
 
 server.listen(PORT, '0.0.0.0', () => {
+  const isDockerEnv = fs.existsSync('/.dockerenv') || process.env.CTYUN_DATA_DIR === '/app/data';
   console.log(`===========================================================`);
-  console.log(`🚀 天翼云全功能多账号可视化管理平台已完全就绪！`);
+  console.log(`🚀 天翼云/移动云电脑全功能可视化管理平台已完全就绪！`);
   console.log(`👉 控制台访问地址: http://127.0.0.1:${PORT}`);
+  console.log(`📁 数据存储目录: ${DATA_DIR} (${isDockerEnv ? 'Docker容器' : '物理机/虚拟机'})`);
+  if (isDockerEnv) {
+    try {
+      const canary = path.join(DATA_DIR, '.volume_check');
+      if (!fs.existsSync(canary)) {
+        fs.writeFileSync(canary, `persisted_test=${new Date().toISOString()}\n`, 'utf8');
+      }
+    } catch (err) {
+      console.warn(`⚠️ [存储警告] 数据目录 ${DATA_DIR} 写入异常，请检查宿主机挂载卷权限: ${err.message}`);
+    }
+  }
   console.log(`===========================================================`);
   appendLog('System', `控制台服务已就绪，当前加载 ${appConfig.accounts.length} 个账号`, 'success');
 });

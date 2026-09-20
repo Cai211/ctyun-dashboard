@@ -152,6 +152,7 @@ class AuthManager {
       enabled: !!notifyConfig?.enabled,
       channel: notifyConfig?.channel || 'webhook',
       webhookUrl: String(notifyConfig?.webhookUrl || '').trim(),
+      secret: String(notifyConfig?.secret || '').trim(),
       customTitleTemplate: String(notifyConfig?.customTitleTemplate || '').trim(),
       customContentTemplate: String(notifyConfig?.customContentTemplate || '').trim()
     };

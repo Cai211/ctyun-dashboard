@@ -204,12 +204,28 @@ class YdpcClient {
       const res = await this.sohoClient.getMqttConnectInfo();
       if (res && res.code === 2000 && res.data) {
         const info = res.data;
-        const host = info.host || 'alive.soho.komect.com';
-        const port = Number(info.port) || 443;
+        // 核心解析：官方 /system/mqttConnect/v1 返回结构解析：
+        // 1. url: "ssl://alive.soho.komect.com" (提取主机与端口)
+        // 2. 官方标准 MQTTS 端口为 8883 (若未指定或配置为 443 会被防火墙直接丢包超时)
+        // 3. 官方 MQTT 凭证字段为 jwt (非 password)
+        // 4. 心跳保活参数为 mqttKeepAlive (非 keepAlive，通常为 30s)
+        let host = 'alive.soho.komect.com';
+        let port = 8883;
+        if (info.url) {
+          const match = info.url.match(/^(?:ssl|mqtts|tcp):\/\/([^:/]+)(?::(\d+))?/i);
+          if (match) {
+            host = match[1];
+            if (match[2]) port = Number(match[2]);
+          }
+        } else if (info.host) {
+          host = info.host;
+          if (info.port && Number(info.port) !== 443) port = Number(info.port);
+        }
+
         const clientId = info.clientId || `cl_${this.account.user.slice(-4)}_${Date.now().toString(36)}`;
         const username = info.userName || info.username || '';
-        const password = info.password || '';
-        const keepAliveSeconds = Number(info.keepAlive) || 60;
+        const password = info.jwt || info.password || '';
+        const keepAliveSeconds = Number(info.mqttKeepAlive || info.keepAlive) || 30;
 
         if (this.mqttClient) {
           this.mqttClient.disconnect();
@@ -227,7 +243,7 @@ class YdpcClient {
 
         await this.mqttClient.connect(10000);
         this._lastMqttFailedAt = 0;
-        this.appendLog('MQTT', `[${accName}] 🟢 官方 MQTT 3.1.1 over TLS 链路已连接保持 (Broker: ${host})`, 'success', accName, 'ydpc');
+        this.appendLog('MQTT', `[${accName}] 🟢 官方 MQTT 3.1.1 over TLS 链路已连接保持 (Broker: ${host}:${port})`, 'success', accName, 'ydpc');
       }
     } catch (err) {
       this._lastMqttFailedAt = Date.now();
