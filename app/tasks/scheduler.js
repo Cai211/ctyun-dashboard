@@ -323,7 +323,14 @@ class TaskScheduler {
         for (const acc of accounts) {
           if (acc.features?.autoSign !== false) {
             const client = this.getClient(acc);
-            executeNativeSign(client, acc, (src, msg, lvl) => this.appendLog(src, `[${acc.name}] ${msg}`, lvl)).catch(() => {});
+            executeNativeSign(client, acc, (src, msg, lvl) => this.appendLog(src, `[${acc.name}] ${msg}`, lvl))
+              .then(signRes => {
+                if (signRes && signRes.isCompleted) {
+                  acc.stats.lastSignTime = getBeijingTimeString();
+                  this.saveConfig();
+                }
+              })
+              .catch(() => {});
           }
         }
       }
@@ -332,7 +339,14 @@ class TaskScheduler {
       for (const acc of accounts) {
         if (acc.features?.autoSign !== false) {
           const client = this.getClient(acc);
-          executeNativeSign(client, acc, (src, msg, lvl) => this.appendLog(src, `[${acc.name}] ${msg}`, lvl)).catch(() => {});
+          executeNativeSign(client, acc, (src, msg, lvl) => this.appendLog(src, `[${acc.name}] ${msg}`, lvl))
+            .then(signRes => {
+              if (signRes && signRes.isCompleted) {
+                acc.stats.lastSignTime = getBeijingTimeString();
+                this.saveConfig();
+              }
+            })
+            .catch(() => {});
         }
       }
     }
@@ -485,9 +499,12 @@ class TaskScheduler {
             this.appendLog('Scheduler', `[${acc.name}] 分项 [每日签到] 由独立 Cron 管辖，本次主调度跳过。`, 'info');
           } else {
             try {
-              await executeNativeSign(client, acc, (src, msg, lvl) => this.appendLog(src, `[${acc.name}] ${msg}`, lvl));
-              acc.stats.lastSignTime = getBeijingTimeString();
-              accSummary.sign = true;
+              const signRes = await executeNativeSign(client, acc, (src, msg, lvl) => this.appendLog(src, `[${acc.name}] ${msg}`, lvl));
+              // 严格以官方任务中心实时判定为准：只有官方确认达成才记录今日打卡标记与时间，绝不虚报
+              if (signRes && signRes.isCompleted) {
+                acc.stats.lastSignTime = getBeijingTimeString();
+                accSummary.sign = true;
+              }
             } catch (e) {
               this.appendLog('Sign', `[${acc.name}] 打卡未达标: ${e.message}`, 'error');
             }
@@ -717,19 +734,31 @@ class TaskScheduler {
     if (allAccountsFullyDone) {
       this.lastCompletedDate = todayStr;
       this.appendLog('Scheduler', `🎉 今日云电脑全部自动化任务已圆满达成！做完即标记今日达成，当天绝不再空转。`, 'success');
-      const detailText = summaryResults.map(r => `• ${r.name}: 打卡[${r.sign ? 'OK' : '跳过'}], AI对话[${r.aiChat ? 'OK' : '跳过'}], 挂机1小时[${r.hang ? '已满1小时' : '已达成'}]`).join('\n');
+      const detailText = summaryResults.map(r => {
+        const signTxt = r.sign ? '已达成' : '已达成';
+        const aiTxt = r.aiChat ? '已达成' : '已达成';
+        const hangTxt = r.hang ? '已满1小时' : '已达成';
+        return `• ${r.name}: 打卡[${signTxt}], AI对话[${aiTxt}], 挂机1小时[${hangTxt}]`;
+      }).join('\n');
       this.sendNotification(
         this.getSettings(),
         `🎉 天翼云电脑今日任务圆满达成 (${todayStr})`,
         `今日自动化任务已全部达成：\n${detailText}\n所有任务均为原生协议极速直连，零 Chromium 内存占用！`
       );
     } else {
-      this.appendLog('Scheduler', `⚡ 今日打卡与AI对话已就绪，长连接正在后台持续挂机累加时长直至满 1 小时达成...`, 'info');
-      const detailText = summaryResults.map(r => `• ${r.name}: 打卡[${r.sign ? 'OK' : '跳过'}], AI对话[${r.aiChat ? 'OK' : '跳过'}], 挂机1小时[${r.hang ? '已达标' : '后台挂机累加中'}]`).join('\n');
+      const anySignPending = summaryResults.some(r => !r.sign);
+      const signStatusNote = anySignPending ? '打卡已建立认领观察' : '打卡已完成';
+      this.appendLog('Scheduler', `⚡ 定时任务已执行 (${signStatusNote})，长连接正在后台持续挂机累加时长直至满 1 小时达成...`, 'info');
+      const detailText = summaryResults.map(r => {
+        const signTxt = r.sign ? '已完成' : '认领已下发待确认(挂机中自动累加)';
+        const aiTxt = r.aiChat ? '已完成' : '跳过/未执行';
+        const hangTxt = r.hang ? '已达标' : '后台挂机累加中';
+        return `• ${r.name}: 打卡[${signTxt}], AI对话[${aiTxt}], 挂机1小时[${hangTxt}]`;
+      }).join('\n');
       this.sendNotification(
         this.getSettings(),
         `⚡ 天翼云电脑定时任务已触发 (${todayStr})`,
-        `打卡与AI对话已完成，长连接正在后台持续挂机中：\n${detailText}`
+        `定时任务已触发执行，长连接正在后台持续挂机中：\n${detailText}`
       );
     }
 

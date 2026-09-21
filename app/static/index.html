@@ -848,7 +848,7 @@
       <div>云电脑可视化全功能多账号管理平台 · 纯协议超轻量架构</div>
       <div style="margin-top: 6px;" id="footer-version-container">
         <span id="footer-version-badge" style="color: var(--text-muted); cursor: default;">
-          📌 当前版本: v2.2.1
+          📌 当前版本: v2.2.2
         </span>
       </div>
     </footer>
@@ -858,20 +858,31 @@
   <div class="modal-backdrop hidden" id="release-notes-modal">
     <div class="modal" style="max-width: 650px; max-height: 85vh; display: flex; flex-direction: column;">
       <div class="modal-header">
-        <h3>🚀 版本更新说明 (v2.2.1)</h3>
+        <h3>🚀 版本更新说明 (v2.2.2)</h3>
         <button class="modal-close" onclick="closeModal('release-notes-modal')">&times;</button>
       </div>
       <div class="modal-body" style="font-size: 13px; line-height: 1.7; color: #334155; overflow-y: auto; max-height: calc(85vh - 120px); display: flex; flex-direction: column; gap: 16px;">
         
-        <!-- v2.2.1 -->
+        <!-- v2.2.2 -->
         <div style="background: #eff6ff; border: 1px solid #bfdbfe; border-radius: 8px; padding: 12px 16px;">
           <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; border-bottom: 1px solid #dbeafe; padding-bottom: 6px;">
-            <div style="font-weight: 700; color: #1d4ed8; font-size: 14.5px;">✨ v2.2.1 稳定性、链路加固与体验优化 (最新)</div>
+            <div style="font-weight: 700; color: #1d4ed8; font-size: 14.5px;">✨ v2.2.2 任务链路加固与真实达成严校验 (最新)</div>
+            <div style="color: #64748b; font-size: 12px;">发布时间：2026-09-21</div>
+          </div>
+          <ul style="padding-left: 18px; display: flex; flex-direction: column; gap: 6px; margin: 0;">
+            <li><b>🎉 彻底解决天翼云登录打卡 40050 报错与假成功漏洞 (Closes #17 & #22)</b>：重构打卡认证链路，与易触发官方风控拦截的自产自销 <code>tokenLogin</code> 彻底解耦；打卡直连视讯网关建立桌面认领会话（Type 118/112/104 握手），并引入最长 300 秒观察窗口持续保持会话与实时轮询官方任务中心，一旦官方确认达成即刻主动释放；全程以官方实时确认状态为唯一成功判定标准，彻底杜绝虚报成功日志与误发达标通知。</li>
+            <li><b>🤖 根治 Docker 长期运行中 AI 对话部分账号失败</b>：升级 CAS 单点登录 Ticket 请求头，完整携带官方要求的会话 Cookie 与签名对齐；内置凭据失效（40010）自动静默刷新机制与多 Cookie 完整捕获，彻底避免容器运行多日后部分账号对话报错。</li>
+            <li><b>⏱️ 1 小时挂机任务绝对隔离与互斥保护</b>：打卡认领与 1 小时挂机建立状态互斥锁，挂机进行中打卡自动安全复用，绝不抢占通道；挂机 120 秒开机就绪轮询、4 轮补挂循环（1x 3600s + 3x 600s）、Type 119/120/137 真机避让与开关实时受控机制 100% 保持零退化。</li>
+          </ul>
+        </div>
+
+        <!-- v2.2.1 -->
+        <div style="background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 8px; padding: 12px 16px;">
+          <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; border-bottom: 1px solid #e2e8f0; padding-bottom: 6px;">
+            <div style="font-weight: 700; color: #334155; font-size: 14.5px;">✨ v2.2.1 稳定性、链路加固与体验优化</div>
             <div style="color: #64748b; font-size: 12px;">发布时间：2026-09-20</div>
           </div>
           <ul style="padding-left: 18px; display: flex; flex-direction: column; gap: 6px; margin: 0;">
-            <li><b>🎉 彻底解决天翼云登录打卡 40050 报错 (Issue #17)</b>：重构打卡认证链路，与易触发官方风控拦截的自产自销 <code>tokenLogin</code> 彻底解耦；打卡直接向视讯网关下发标准 25 秒轻量桌面认领脉冲（Type 118/112/104 握手），真实满足官方任务中心【登录AI云电脑】达成判定 (+100积分)，永久根绝 Code 40050 报错与虚假未授信警告。</li>
-            <li><b>⏱️ 1 小时挂机任务绝对隔离与互斥保护</b>：打卡认领与 1 小时挂机建立状态互斥锁，挂机进行中打卡自动安全复用，绝不抢占通道；挂机 120 秒开机就绪轮询、4 轮补挂循环（1x 3600s + 3x 600s）、Type 119/120/137 真机避让与开关实时受控机制 100% 保持零退化。</li>
             <li><b>📡 移动云官方 MQTT 字段完整适配与 8883 端口纠偏</b>：精准适配官方 <code>/system/mqttConnect/v1</code> 真实数据结构（<code>jwt</code> 鉴权令牌、<code>url</code> 协议地址与 <code>mqttKeepAlive: 30</code> 参数）；全面纠偏并锁定官方开放的标准 MQTTS 8883 端口，彻底避免误连 443 端口被防火墙丢包导致 10 秒超时。</li>
             <li><b>🌐 双栈网络智能选路与全局 IPv4 优先</b>：主服务注入全局 IPv4 优先策略（<code>ipv4first</code>），并在 MQTT 协议层实现智能双栈选路（优先直连 IPv4 并携带原生 SNI，且平滑向下兼容纯 IPv6 独占环境），彻底解决 Docker 容器及局域网双栈下因缺少 IPv6 外网网关引发的 10 秒超时假死。</li>
             <li><b>🖥️ 前端单机与多机独立周期精准联动呈现</b>：重构周期概览算法，单台云电脑设置周期即时生效回显（如单机 5 分钟），多机全量相同时统一展示，多机独立差异化时展示各机明细，彻底杜绝单机被全局 10 分钟默认值遮蔽。</li>

@@ -1835,7 +1835,7 @@ class CtYunClient {
   }
 
   // 单台云电脑视讯通道保活会话
-  async runDesktopKeepAliveSession(desktop, isHangMode = false, pulseConnectSec = 20) {
+  async runDesktopKeepAliveSession(desktop, isHangMode = false, pulseConnectSec = 20, goalTaskName = '') {
     const accName = this.account.name || this.account.user;
     const desktopId = desktop.objId || desktop.desktopId;
     const desktopName = desktop.objName || desktop.desktopName || '云电脑';
@@ -1886,6 +1886,7 @@ class CtYunClient {
       let sessionTimeout = null;
       let hangCheckInterval = null;
       let wsConnectedAt = 0;
+      let goalAchieved = false; // 目标任务 (如登录AI云电脑) 是否已获得官方确认
       let clientPresenceSignal = false; // 官方客户端在席信令 (Type 119/120/137)：收到即代表真机用户接入
 
       const endSession = (reason) => {
@@ -1907,7 +1908,7 @@ class CtYunClient {
           try { this.ws.close(); } catch (e) {}
         }
         this.wsAlive = false;
-        resolveSession({ success: true, reason });
+        resolveSession({ success: true, reason, goalAchieved });
       };
 
       this.endCurrentSession = endSession;
@@ -1929,9 +1930,10 @@ class CtYunClient {
         const maxHangTimeout = Math.min(3600, Math.max(minSec, parseInt(pulseConnectSec) || 3600));
         this.metrics.keepAliveSeconds = maxHangTimeout;
         this.metrics.cycleCountdown = maxHangTimeout;
+        const timeoutLabel = goalTaskName ? '任务认领观察' : '挂机长连接看门狗';
         sessionTimeout = setTimeout(() => {
-          appendLog('Heartbeat', `[${accName}][${desktopName}] 挂机长连接看门狗周期到 (${maxHangTimeout}s)，平滑刷新会话...`, 'info');
-          endSession('Hang Watchdog');
+          appendLog('Heartbeat', `[${accName}][${desktopName}] ${timeoutLabel}周期到 (${maxHangTimeout}s)，平滑刷新会话...`, 'info');
+          endSession(goalTaskName ? 'Sign Watchdog' : 'Hang Watchdog');
         }, maxHangTimeout * 1000);
       } else {
         const connectSec = Math.min(60, Math.max(15, pulseConnectSec));
@@ -2134,34 +2136,45 @@ class CtYunClient {
                 }
               }, 5000);
 
-              if (isHangMode) {
-                const checkHangProgress = async () => {
+              if (isHangMode || goalTaskName) {
+                const watchTaskName = goalTaskName || '使用1小时';
+                const isGoalHang = !goalTaskName; // 未指定目标 = 经典挂机 (1 小时)
+                const checkGoalProgress = async () => {
                   if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
                   await this.refreshOfficialTasks();
-                  const hangTask = this.metrics.officialTasks?.find(t => t.name.includes('使用1小时'));
-                  const curSec = hangTask ? (hangTask.current || 0) : 0;
-                  const totSec = hangTask ? (hangTask.total || 3600) : 3600;
+                  const goalTask = this.metrics.officialTasks?.find(t => t.name.includes(watchTaskName));
+                  const curSec = goalTask ? (goalTask.current || 0) : 0;
+                  const totSec = goalTask ? (goalTask.total || 3600) : 3600;
 
-                  if (curSec >= totSec || (hangTask && hangTask.status === 2)) {
+                  if (goalTask && (goalTask.status === 2 || (totSec > 0 && curSec >= totSec))) {
                     if (hangCheckInterval) clearInterval(hangCheckInterval);
-                    appendLog('KeepAlive', `[${accName}][${desktopName}] 🎉 恭喜！今日使用 AI 云电脑 1 小时挂机任务已圆满达成 (+100积分)！后台长连接立即主动让位关闭，转入脉冲保活防休眠模式。`, 'success');
-                    sendAccountNotification(
-                      this.account,
-                      `🎉 挂机1小时任务达成 - ${accName}`,
-                      `账号【${accName}】今日使用 AI 云电脑达到 1 小时任务已完成，100 积分已入账！`
-                    );
-                    endSession('Today Hang Goal Achieved');
-                  } else {
+                    if (isGoalHang) {
+                      appendLog('KeepAlive', `[${accName}][${desktopName}] 🎉 恭喜！今日使用 AI 云电脑 1 小时挂机任务已圆满达成 (+100积分)！后台长连接立即主动让位关闭，转入脉冲保活防休眠模式。`, 'success');
+                      sendAccountNotification(
+                        this.account,
+                        `🎉 挂机1小时任务达成 - ${accName}`,
+                        `账号【${accName}】今日使用 AI 云电脑达到 1 小时任务已完成，100 积分已入账！`
+                      );
+                      endSession('Today Hang Goal Achieved');
+                    } else {
+                      goalAchieved = true;
+                      appendLog('Sign', `[${accName}][${desktopName}] 🎉 官方任务中心已实时确认【${watchTaskName}】达成 (+100积分)！登录打卡已真实完成！`, 'success');
+                      endSession('Sign Goal Achieved');
+                    }
+                  } else if (isGoalHang) {
                     const curMin = Math.floor(curSec / 60);
                     const totMin = Math.floor(totSec / 60);
                     const remainSec = Math.max(0, totSec - curSec);
                     this.metrics.lastHeartbeatResult = `[${desktopName}] 挂机累加中: 已在线 ${curMin}/${totMin} 分钟 (${curSec}/${totSec}秒，剩余约 ${Math.ceil(remainSec / 60)} 分钟)`;
                     this.metrics.cycleCountdown = remainSec;
+                  } else {
+                    this.metrics.lastHeartbeatResult = `[${desktopName}] 桌面登录认领保持中，等待官方任务中心确认【${watchTaskName}】...`;
+                    this.metrics.cycleCountdown = Math.max(0, Math.round((totSec - curSec) / 1000));
                   }
                 };
 
-                setTimeout(checkHangProgress, 2500);
-                hangCheckInterval = setInterval(checkHangProgress, 15000);
+                setTimeout(checkGoalProgress, 2500);
+                hangCheckInterval = setInterval(checkGoalProgress, 15000);
               } else {
                 this.metrics.lastHeartbeatResult = `[${desktopName}] 脉冲保活握手就绪，已向网关发送 REDQ/心跳`;
               }
@@ -2427,8 +2440,8 @@ class CtYunClient {
           continue;
         }
 
-        // 如果 Scheduler 正在执行独占挂机任务，常态保活循环主动避让等待
-        if (this.isTaskHanging) {
+        // 如果 Scheduler 正在执行独占挂机任务，或登录打卡认领会话进行中，常态保活循环主动避让等待
+        if (this.isTaskHanging || this._signSessionActive) {
           await new Promise(r => setTimeout(r, 5000));
           continue;
         }
@@ -4500,15 +4513,18 @@ function rewardNeedsDesktop(prodId, prodType) {
     try {
       if (taskType === 'sign') {
         executeNativeSign(client, acc, (src, msg, lvl) => appendLog(src, `[${acc.name}] ${msg}`, lvl))
-          .then(async () => {
-            acc.stats.lastSignTime = now;
-            saveConfig(appConfig);
+          .then(async (signRes) => {
             await client.refreshOfficialTasks();
-            sendAccountNotification(
-              acc,
-              `✅ 登录打卡达成 - ${acc.name}`,
-              `账号【${acc.name}】今日登录AI云电脑任务已完成，100 积分已到账！`
-            );
+            // 严格以官方任务中心实时判定为准：只有真正确认达成才更新完成时间与推送成功通知，绝不虚报
+            if (signRes && signRes.isCompleted) {
+              acc.stats.lastSignTime = now;
+              saveConfig(appConfig);
+              sendAccountNotification(
+                acc,
+                `✅ 登录打卡达成 - ${acc.name}`,
+                `账号【${acc.name}】今日登录AI云电脑任务已完成，100 积分已到账！`
+              );
+            }
           })
           .catch(err => appendLog('Sign', `[${acc.name}] 打卡执行异常: ${err.message}`, 'error'));
 

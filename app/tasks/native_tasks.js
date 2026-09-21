@@ -41,32 +41,69 @@ async function executeNativeAiChat(client, acc, onLog = console.log) {
   }
 
   // 2. 确保客户端登录并获取 CAS Service Ticket
-  if (!client.loginInfo) {
-    onLog('AIChat', `正在刷新天翼云客户端认证会话...`, 'info');
-    const loginRes = await client.login();
-    if (!loginRes.success) throw new Error(loginRes.error || '登录失败');
+  const service = 'https://eaichat.ctyun.cn:443/chat/#/aichat';
+
+  async function getCasTicket(forceRefresh = false) {
+    if (forceRefresh) {
+      onLog('AIChat', `正在刷新天翼云客户端认证凭据...`, 'info');
+      try {
+        if (typeof client.renewToken === 'function') {
+          await client.renewToken();
+        } else if (typeof client.login === 'function') {
+          client.loginInfo = null;
+          await client.login();
+        }
+      } catch (err) {
+        onLog('AIChat', `凭据续期尝试失败 (${err.message})，使用现有凭据重试...`, 'warning');
+      }
+    } else if (!client.loginInfo) {
+      onLog('AIChat', `正在刷新天翼云客户端认证会话...`, 'info');
+      const loginRes = await client.login();
+      if (!loginRes.success) throw new Error(loginRes.error || '登录失败');
+    }
+
+    const authData = client.loginInfo;
+    if (!authData) throw new Error('账号尚未登录');
+
+    const nowTs = Date.now().toString();
+    const ver = client.version || '103020001';
+    const sigStr = `${client.deviceType}${nowTs}${authData.tenantId}${nowTs}${authData.userId}${ver}${authData.secretKey}`;
+
+    let headers;
+    if (typeof client.getSignedHeaders === 'function') {
+      headers = client.getSignedHeaders();
+    } else {
+      headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/137.0.0.0',
+        'ctg-devicetype': client.deviceType,
+        'ctg-version': ver,
+        'ctg-devicecode': acc.deviceCode,
+        'ctg-userid': String(authData.userId),
+        'ctg-tenantid': String(authData.tenantId),
+        'ctg-timestamp': nowTs,
+        'ctg-requestid': nowTs,
+        'ctg-signaturestr': md5(sigStr),
+        'Referer': 'https://pc.ctyun.cn/'
+      };
+      if (authData.token) {
+        headers['Cookie'] = `token=${authData.token}`;
+      }
+    }
+
+    const resp = await fetch(`https://desk.ctyun.cn:8810/api/auth/client/getTicket?service=${encodeURIComponent(service)}`, {
+      headers
+    });
+    return await resp.json();
   }
 
   onLog('AIChat', `请求天翼 CAS 单点登录 Ticket 票据...`, 'info');
-  const nowTs = Date.now().toString();
-  const authData = client.loginInfo;
-  const sigStr = `${client.deviceType}${nowTs}${authData.tenantId}${nowTs}${authData.userId}103020001${authData.secretKey}`;
-  const service = 'https://eaichat.ctyun.cn:443/chat/#/aichat';
+  let ticketRes = await getCasTicket(false);
 
-  const ticketRes = await (await fetch(`https://desk.ctyun.cn:8810/api/auth/client/getTicket?service=${encodeURIComponent(service)}`, {
-    headers: {
-      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/137.0.0.0',
-      'ctg-devicetype': client.deviceType,
-      'ctg-version': '103020001',
-      'ctg-devicecode': acc.deviceCode,
-      'ctg-userid': String(authData.userId),
-      'ctg-tenantid': String(authData.tenantId),
-      'ctg-timestamp': nowTs,
-      'ctg-requestid': nowTs,
-      'ctg-signaturestr': md5(sigStr),
-      'Referer': 'https://pc.ctyun.cn/'
-    }
-  })).json();
+  // 40010 或未取得 ticket：长效运行容器中内存 token 过期，自动静默续期并重试一次
+  if (ticketRes.code === 40010 || ticketRes.code === '40010' || !ticketRes.data?.ticket) {
+    onLog('AIChat', `CAS Ticket 提示会话失效或未返回票据 (${ticketRes.msg || ticketRes.code || '无Ticket'})，正在自动重新续期凭据...`, 'info');
+    ticketRes = await getCasTicket(true);
+  }
 
   if (!ticketRes.data || !ticketRes.data.ticket) {
     throw new Error('获取 CAS Ticket 失败: ' + (ticketRes.msg || JSON.stringify(ticketRes)));
@@ -104,7 +141,12 @@ async function executeNativeAiChat(client, acc, onLog = console.log) {
     throw new Error('SSO Ticket 鉴权换取失败: ' + (authJson.resultMsg || JSON.stringify(authJson)));
   }
 
-  const rawCookies = authPostRes.headers.get('set-cookie') || '';
+  let rawCookies = '';
+  if (typeof authPostRes.headers.getSetCookie === 'function') {
+    rawCookies = authPostRes.headers.getSetCookie().join('; ');
+  } else {
+    rawCookies = authPostRes.headers.get('set-cookie') || '';
+  }
   const ylTokenMatch = rawCookies.match(/YL-Token=([^;]+)/);
   const ylSsidMatch = rawCookies.match(/YL-Ssid=([^;]+)/);
   const ylToken = ylTokenMatch ? ylTokenMatch[1] : (authPostRes.headers.get('yl-authorization') || '');
@@ -164,6 +206,14 @@ async function executeNativeAiChat(client, acc, onLog = console.log) {
   }
 
   const resText = await chatRes.text();
+  try {
+    const chatJson = JSON.parse(resText);
+    if (chatJson.code && chatJson.code !== 0 && chatJson.code !== 200) {
+      throw new Error(`AI 对话业务返回错误: ${chatJson.message || chatJson.msg || resText}`);
+    }
+  } catch (e) {
+    if (e.message && e.message.startsWith('AI 对话业务返回错误')) throw e;
+  }
   onLog('AIChat', `✅ AI 对话成功完成！已获取今日 100 积分！`, 'success');
   
   await client.refreshOfficialTasks();
@@ -237,33 +287,41 @@ async function executeNativeSign(client, acc, onLog = console.log) {
       }
     }
 
-    // 6. 核心认证：通过 25 秒轻量桌面认领脉冲向视讯网关下发 118身份 + 112登录凭据 + 104握手确认包
-    // 这正是天翼云营销中心记录【登录AI云电脑】达成的真实判定事件（彻底杜绝自产自销 tokenLogin 触发 40050）
-    onLog('Sign', `[${accName}][${targetName}] 正在建立视讯网关登录认领脉冲 (Type 118/112/104)...`, 'info');
-    client.isTaskHanging = true;
+    // 6. 核心认证：建立桌面认领会话并向视讯网关下发 118身份 + 112登录凭据 + 104握手确认包
+    // 官方营销中心以「实际进入云电脑桌面并保持会话」为准，记录【登录AI云电脑】达成 (+100积分)。
+    // 因此维持一个最长 300 秒的认领观察窗口，期间持续心跳并实时轮询官方任务中心，一旦官方确认达成立即主动释放通道。
+    // 只有官方任务中心确认达成才会记录成功，绝不虚报。
+    onLog('Sign', `[${accName}][${targetName}] 正在建立视讯网关桌面登录认领会话 (Type 118/112/104)，保持观察等待官方确认...`, 'info');
+
+    // 独立会话占用标记：仅用于让常态脉冲循环避让，绝不触碰挂机任务的 isTaskHanging 状态位，杜绝互斥串扰
+    client._signSessionActive = true;
+    let claimResult = null;
     try {
       if (client.endCurrentSession) {
         client.endCurrentSession('Yield to Sign Claim');
       }
-      await client.runDesktopKeepAliveSession(mainDesktop, true, 25);
+      claimResult = await client.runDesktopKeepAliveSession(mainDesktop, true, 300, '登录AI云电脑');
     } finally {
-      client.isTaskHanging = false;
+      client._signSessionActive = false;
     }
 
-    // 7. 等待 3 秒让天翼云营销积分系统记录登录事件，并重新拉取官方任务中心确认
-    await new Promise(r => setTimeout(r, 3000));
+    // 7. 会话结束后再次重新拉取官方任务中心，以官方实时状态为唯一判定依据
     await client.refreshOfficialTasks();
 
     const verifiedTask = client.metrics.officialTasks?.find(t => t.name.includes('登录AI云电脑') || t.name.includes('登录'));
     const isDone = verifiedTask ? (verifiedTask.status === 2 || (verifiedTask.total > 0 && verifiedTask.current >= verifiedTask.total)) : false;
+    const goalConfirmed = !!(claimResult && claimResult.goalAchieved) || isDone;
+    const claimReason = (claimResult && claimResult.reason) || '';
 
-    if (isDone) {
+    if (goalConfirmed) {
       onLog('Sign', `🎉 官方任务中心已确认【登录AI云电脑】达成 (+100积分)！`, 'success');
+    } else if (claimReason === 'Preempted by Client' || claimReason === 'Yield to External Client' || claimReason === 'Yield to Web User') {
+      onLog('Sign', `[${accName}][${targetName}] 检测到官方客户端接入/用户操作，登录认领会话已主动让位，本次未确认达成。`, 'warning');
     } else {
-      onLog('Sign', `✅ 官方桌面登录认领信令已成功送达 (官方积分通常在数分钟内同步刷新)。`, 'info');
+      onLog('Sign', `[${accName}][${targetName}] 本轮认领观察窗口结束，官方任务中心暂未确认【登录AI云电脑】达成；桌面会话认领已完成，若稍后运行 1 小时挂机或官方客户端接入将自动计入积分。`, 'info');
     }
 
-    return { success: true, isCompleted: isDone, message: isDone ? '官方已确认登录打卡完成' : '打卡认领信令已下发' };
+    return { success: true, isCompleted: goalConfirmed, message: goalConfirmed ? '官方已确认登录打卡完成' : '已建立登录认领会话，等待官方确认积分计入' };
   } catch (e) {
     onLog('Sign', `登录打卡异常: ${e.message}`, 'error');
     throw e;
