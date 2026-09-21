@@ -2279,14 +2279,16 @@ class CtYunClient {
         return { success: true, isCompleted: false, message: '名下所有云电脑均已关闭任务开关' };
       }
 
-      const runningReady = taskOnDesktops.filter(d => isDesktopRunning(d) && d.keepaliveEnabled !== false);
-      const runningAny = taskOnDesktops.filter(d => isDesktopRunning(d));
-      const standbyReady = taskOnDesktops.filter(d => d.keepaliveEnabled !== false);
-      const mainDesktop = runningReady[0] || runningAny[0] || standbyReady[0] || taskOnDesktops[0];
+      const runningDesktops = taskOnDesktops.filter(d => isDesktopRunning(d));
+      const mainDesktop = runningDesktops[0] || taskOnDesktops[0];
       const targetName = mainDesktop.objName || mainDesktop.desktopName || '云电脑';
       const targetId = String(mainDesktop.objId || mainDesktop.desktopId);
 
       if (!isDesktopRunning(mainDesktop)) {
+        if (mainDesktop.autoBootEnabled === false) {
+          onLog('Hang', `[${accName}][${targetName}] 云电脑未开机且已关闭自动开机，跳过本次挂机任务。`, 'info');
+          return { success: true, isCompleted: false, message: '云电脑未开机且已关闭自动开机' };
+        }
         onLog('Hang', `[${accName}][${targetName}] 云电脑未开机，正在下发开机唤醒指令...`, 'info');
         await this.controlPower(targetId, 'poweron').catch(() => {});
         // 开机就绪轮询 (最长 120 秒)：杜绝未就绪即认领导致官方计时不累加
@@ -2329,10 +2331,10 @@ class CtYunClient {
           onLog('Hang', `[${accName}][${targetName}] 官方客户端避让冷却期内 (剩余 ${waitMin} 分钟)，挂机${attempt > 1 ? '补挂' : ''}终止。`, 'info');
           break;
         }
-        // 5.3 单机独立开关实时校验：用户在挂机途中关闭该主机的【🎯任务】或【⚡保活】开关，立即尊重用户意图终止
+        // 5.3 单机独立开关实时校验：用户在挂机途中关闭该主机的【🎯任务】开关，立即尊重用户意图终止
         const freshTarget = (this.account.desktops || []).find(d => String(d.objId || d.desktopId) === targetId);
-        if (freshTarget && (freshTarget.taskEnabled === false || freshTarget.keepaliveEnabled === false)) {
-          onLog('Hang', `[${accName}][${targetName}] 检测到该主机的【🎯任务/⚡保活】开关已被用户关闭，挂机立即终止。`, 'info');
+        if (freshTarget && freshTarget.taskEnabled === false) {
+          onLog('Hang', `[${accName}][${targetName}] 检测到该主机的【🎯任务】开关已被用户关闭，挂机立即终止。`, 'info');
           break;
         }
 
@@ -2622,7 +2624,9 @@ function initAllKeepAlive() {
   }
 }
 
-setTimeout(initAllKeepAlive, 2000);
+if (require.main === module) {
+  setTimeout(initAllKeepAlive, 2000);
+}
 
 // 初始化定时任务调度中心
 const taskScheduler = new TaskScheduler({
@@ -2655,7 +2659,9 @@ const taskScheduler = new TaskScheduler({
   },
   saveConfig: () => saveConfig(appConfig)
 });
-setTimeout(() => taskScheduler.start(), 3000);
+if (require.main === module) {
+  setTimeout(() => taskScheduler.start(), 3000);
+}
 
 // ==========================================================
 // HTTP 路由与 API 服务
@@ -3931,8 +3937,8 @@ function rewardNeedsDesktop(prodId, prodType) {
       client.account.desktops = acc.desktops;
     }
 
-    // 若当前正在执行该主机的挂机任务且用户关闭了任务/保活，立即安全释放当前长连接
-    if ((featureName === 'taskEnabled' || featureName === 'keepaliveEnabled') && finalValue === false && client && client.isTaskHanging) {
+    // 若当前正在执行该主机的挂机任务且用户关闭了任务开关，立即安全释放当前长连接
+    if (featureName === 'taskEnabled' && finalValue === false && client && client.isTaskHanging) {
       if (String(client.metrics?.desktopId) === String(vmKey)) {
         if (client.endCurrentSession) {
           client.endCurrentSession('User Disabled Task on Active Desktop');
@@ -5501,22 +5507,32 @@ function rewardNeedsDesktop(prodId, prodType) {
   jsonResponse(res, { error: 'Not Found' }, 404);
 });
 
-server.listen(PORT, '0.0.0.0', () => {
-  const isDockerEnv = fs.existsSync('/.dockerenv') || process.env.CTYUN_DATA_DIR === '/app/data';
-  console.log(`===========================================================`);
-  console.log(`🚀 天翼云/移动云电脑全功能可视化管理平台已完全就绪！`);
-  console.log(`👉 控制台访问地址: http://127.0.0.1:${PORT}`);
-  console.log(`📁 数据存储目录: ${DATA_DIR} (${isDockerEnv ? 'Docker容器' : '物理机/虚拟机'})`);
-  if (isDockerEnv) {
-    try {
-      const canary = path.join(DATA_DIR, '.volume_check');
-      if (!fs.existsSync(canary)) {
-        fs.writeFileSync(canary, `persisted_test=${new Date().toISOString()}\n`, 'utf8');
+if (require.main === module) {
+  server.listen(PORT, '0.0.0.0', () => {
+    const isDockerEnv = fs.existsSync('/.dockerenv') || process.env.CTYUN_DATA_DIR === '/app/data';
+    console.log(`===========================================================`);
+    console.log(`🚀 天翼云/移动云电脑全功能可视化管理平台已完全就绪！`);
+    console.log(`👉 控制台访问地址: http://127.0.0.1:${PORT}`);
+    console.log(`📁 数据存储目录: ${DATA_DIR} (${isDockerEnv ? 'Docker容器' : '物理机/虚拟机'})`);
+    if (isDockerEnv) {
+      try {
+        const canary = path.join(DATA_DIR, '.volume_check');
+        if (!fs.existsSync(canary)) {
+          fs.writeFileSync(canary, `persisted_test=${new Date().toISOString()}\n`, 'utf8');
+        }
+      } catch (err) {
+        console.warn(`⚠️ [存储警告] 数据目录 ${DATA_DIR} 写入异常，请检查宿主机挂载卷权限: ${err.message}`);
       }
-    } catch (err) {
-      console.warn(`⚠️ [存储警告] 数据目录 ${DATA_DIR} 写入异常，请检查宿主机挂载卷权限: ${err.message}`);
     }
-  }
-  console.log(`===========================================================`);
-  appendLog('System', `控制台服务已就绪，当前加载 ${appConfig.accounts.length} 个账号`, 'success');
-});
+    console.log(`===========================================================`);
+    appendLog('System', `控制台服务已就绪，当前加载 ${appConfig.accounts.length} 个账号`, 'success');
+  });
+}
+
+module.exports = {
+  CtYunClient,
+  appConfig,
+  server,
+  taskScheduler,
+  initAllKeepAlive
+};

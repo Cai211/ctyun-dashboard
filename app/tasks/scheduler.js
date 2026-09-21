@@ -489,7 +489,7 @@ class TaskScheduler {
 
       try {
         // 1. 底层 WSS 长连接保活守护 (避免被踢) —— 仅在保活开关开启时拉起，尊重用户主动关机保护
-        if (!client.wsAlive && acc.features?.cloudHang !== false && acc.features?.keepAlive !== false) {
+        if (!client.wsAlive && acc.features?.keepAlive !== false) {
           client.startKeepAliveWorker();
         }
 
