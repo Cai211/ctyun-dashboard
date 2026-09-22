@@ -19,6 +19,18 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      # 质量闸门：语法检查 + 结构性回归测试。任一失败即终止，绝不构建/推送坏镜像。
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Syntax check (node --check)
+        run: node tests/syntax_check.js
+
+      - name: Regression invariants
+        run: node tests/regression.test.js
+
       - name: Set up QEMU (for multi-arch)
         uses: docker/setup-qemu-action@v3
 

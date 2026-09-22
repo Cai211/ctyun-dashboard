@@ -535,7 +535,6 @@ function buildAccountCardElement(acc, slotIndex) {
 
     const isAllYdpcChannelsOff = f.cagKeepAlive === false && f.mqttKeepAlive === false && f.sohoHeartbeat === false;
     const isGlobalKeepAliveOff = f.keepAlive === false || isAllYdpcChannelsOff;
-    const isGlobalBootOff = f.autoBoot === false;
 
     let ydpcMultiStatusBadge = '';
     if (isGlobalKeepAliveOff) {
@@ -569,7 +568,6 @@ function buildAccountCardElement(acc, slotIndex) {
               const memClean = vm.memory ? String(vm.memory).replace(/[Gg]+$/g, '') : '';
               const specSuffix = (cpuClean && memClean) ? ` · ${cpuClean}核/${memClean}G` : (cpuClean ? ` · ${cpuClean}核` : (memClean ? ` · ${memClean}G` : ''));
               const isKeepaliveOn = vm.keepaliveEnabled !== false;
-              const isAutoBootOn = vm.autoBootEnabled !== false;
               const usid = String(vm.userServiceId || '');
 
               let keepClass = isKeepaliveOn ? 'pill-on-keepalive' : 'pill-off-keepalive';
@@ -577,13 +575,6 @@ function buildAccountCardElement(acc, slotIndex) {
               if (isGlobalKeepAliveOff && isKeepaliveOn) {
                 keepClass = 'pill-paused';
                 keepText = '待命(总关)';
-              }
-
-              let bootClass = isAutoBootOn ? 'pill-on-autoboot' : 'pill-off-autoboot';
-              let bootText = isAutoBootOn ? '开' : '关';
-              if (isGlobalBootOff && isAutoBootOn) {
-                bootClass = 'pill-paused';
-                bootText = '待命(总关)';
               }
 
               return `
@@ -604,7 +595,6 @@ function buildAccountCardElement(acc, slotIndex) {
                   <div class="vm-device-footer">
                     <div class="pill-btn-group">
                       <button type="button" class="pill-toggle-btn ${keepClass}" id="pill-keep-${acc.id}-${usid}" onclick="toggleVmFeature('${acc.id}', '${usid}', 'keepaliveEnabled', ${!isKeepaliveOn})" title="单台云电脑独立保活开关">⚡保活: ${keepText}</button>
-                      <button type="button" class="pill-toggle-btn ${bootClass}" id="pill-boot-${acc.id}-${usid}" onclick="toggleVmFeature('${acc.id}', '${usid}', 'autoBootEnabled', ${!isAutoBootOn})" title="单台云电脑自动开机守护开关">🛡️守护: ${bootText}</button>
                       <select class="pill-select" id="pill-interval-${acc.id}-${usid}" onchange="changeVmInterval('${acc.id}', '${usid}', this.value)" title="单台云电脑独立保活周期设置">
                         <option value="" ${!vm.keepaliveInterval ? 'selected' : ''}>⏱️继承默认</option>
                         <option value="300" ${vm.keepaliveInterval == 300 ? 'selected' : ''}>⏱️5分钟</option>
@@ -613,9 +603,6 @@ function buildAccountCardElement(acc, slotIndex) {
                         <option value="1800" ${vm.keepaliveInterval == 1800 ? 'selected' : ''}>⏱️30分钟</option>
                         <option value="3600" ${vm.keepaliveInterval == 3600 ? 'selected' : ''}>⏱️60分钟</option>
                       </select>
-                    </div>
-                    <div style="display: flex; gap: 4px; align-items: center;">
-                      ${!isRunning ? `<button type="button" class="pill-toggle-btn pill-action-boot" onclick="bootYdpcVm('${acc.id}', '${usid}')" title="单独对该台移动云电脑下发开机指令">🖥️ 开机</button>` : ''}
                     </div>
                   </div>
                 </div>
@@ -680,13 +667,8 @@ function buildAccountCardElement(acc, slotIndex) {
           <span style="font-size: 11px; color: var(--text-muted); font-weight: normal; flex-shrink: 0; white-space: nowrap;">点击收起/展开</span>
         </summary>
         <div style="display: flex; flex-direction: column; gap: 8px; margin-top: 8px;">
-          <div class="feature-row">
-            <span>🛡️ 自动开机守护 (检测到关机自动唤醒)</span>
-            <label class="switch">
-              <input type="checkbox" ${f.autoBoot !== false ? 'checked' : ''} onchange="toggleFeature('${acc.id}', 'autoBoot', this.checked)">
-              <span class="slider"></span>
-            </label>
-          </div>
+          <!-- 【2026-09-22 用户要求】原「🛡️ 自动开机守护」开关已移除：
+               移动云底层开机引擎 (SC/ZTE 直连开机) 已整体删除，本系统不再具备任何开机能力。 -->
           <div class="feature-row">
             <span>🔄 ZTEC CAG TCP 三阶段握手保活</span>
             <label class="switch">
@@ -714,7 +696,6 @@ function buildAccountCardElement(acc, slotIndex) {
       <!-- 快捷操作区 -->
       <div class="card-actions">
         <div class="card-action-tools" style="grid-template-columns: repeat(auto-fit, minmax(80px, 1fr));">
-          <button class="btn btn-tool" onclick="bootYdpcVm('${acc.id}', '${primaryUsid}')" title="移动云电脑开机 (支持 SC/ZTE 自适应开机)">🖥️ 开机/唤醒</button>
           <button class="btn btn-tool" onclick="pingYdpcCag('${acc.id}')" title="立即向中兴 CAG 发起 TCP 握手保活">🔄 CAG 握手</button>
           <button class="btn btn-tool" onclick="heartbeatYdpc('${acc.id}')" title="立即发送一次 SOHO 活跃心跳">💓 发送心跳</button>
         </div>
@@ -1056,7 +1037,6 @@ function updateAccountsInPlace(filteredAccounts) {
     if (isYdpc && acc.vms) {
       const isAllYdpcChannelsOff = f.cagKeepAlive === false && f.mqttKeepAlive === false && f.sohoHeartbeat === false;
       const isGlobalKeepAliveOff = f.keepAlive === false || isAllYdpcChannelsOff;
-      const isGlobalBootOff = f.autoBoot === false;
 
       if (multiStatusEl) {
         if (isGlobalKeepAliveOff) {
@@ -1077,7 +1057,6 @@ function updateAccountsInPlace(filteredAccounts) {
       acc.vms.forEach(vm => {
         const usid = String(vm.userServiceId || '');
         const isKeepaliveOn = vm.keepaliveEnabled !== false;
-        const isAutoBootOn = vm.autoBootEnabled !== false;
         const pKeep = document.getElementById(`pill-keep-${acc.id}-${usid}`);
         if (pKeep) {
           let keepClass = isKeepaliveOn ? 'pill-on-keepalive' : 'pill-off-keepalive';
@@ -1088,17 +1067,6 @@ function updateAccountsInPlace(filteredAccounts) {
           }
           pKeep.className = `pill-toggle-btn ${keepClass}`;
           pKeep.innerText = `⚡保活: ${keepText}`;
-        }
-        const pBoot = document.getElementById(`pill-boot-${acc.id}-${usid}`);
-        if (pBoot) {
-          let bootClass = isAutoBootOn ? 'pill-on-autoboot' : 'pill-off-autoboot';
-          let bootText = isAutoBootOn ? '开' : '关';
-          if (isGlobalBootOff && isAutoBootOn) {
-            bootClass = 'pill-paused';
-            bootText = '待命(总关)';
-          }
-          pBoot.className = `pill-toggle-btn ${bootClass}`;
-          pBoot.innerText = `🛡️守护: ${bootText}`;
         }
         const pInterval = document.getElementById(`pill-interval-${acc.id}-${usid}`);
         if (pInterval && document.activeElement !== pInterval) {
@@ -1517,6 +1485,13 @@ async function toggleFeature(accId, featureKey, checked) {
 
 // 单台云电脑独立特性开关切换 (优化为原地乐观更新与异步上报)
 async function toggleVmFeature(accId, vmKey, featureName, nextVal) {
+  // 【2026-09-22 用户要求·硬闸门】移动云"自动开机守护"已随底层开机引擎 (boot_engine) 整体删除。
+  // 此处显式拒绝，确保该能力不会因为残留的 UI 或外部调用而被重新接回。
+  if (featureName === 'autoBootEnabled' || featureName === 'autoBoot') {
+    showToast("移动云【自动开机守护】已移除（底层开机能力已删除）。如需开机请在移动云官方 App 连接一次。", "error");
+    return;
+  }
+
   const acc = accounts.find(a => a.id === accId);
   if (!acc) return;
 
@@ -1532,33 +1507,32 @@ async function toggleVmFeature(accId, vmKey, featureName, nextVal) {
   }
 
   // 1. 立即乐观更新 DOM 按钮状态
-  let prefixKey = 'pill-boot-';
-  if (featureName === 'keepaliveEnabled') prefixKey = 'pill-keep-';
-  else if (featureName === 'taskEnabled') prefixKey = 'pill-task-';
+  // (原 pill-boot- / pill-on-autoboot / 「🛡️守护」分支已随"自动开机守护"一并移除，见本函数开头的硬闸门)
+  let prefixKey = '';
+  let onClass = '';
+  let offClass = '';
+  let labelPrefix = '';
+  if (featureName === 'keepaliveEnabled') {
+    prefixKey = 'pill-keep-';
+    onClass = 'pill-on-keepalive';
+    offClass = 'pill-off-keepalive';
+    labelPrefix = '⚡保活: ';
+  } else if (featureName === 'taskEnabled') {
+    prefixKey = 'pill-task-';
+    onClass = 'pill-on-task';
+    offClass = 'pill-off-task';
+    labelPrefix = '🎯任务: ';
+  }
 
-  const pillId = prefixKey + accId + '-' + vmKey;
-  const pillBtn = document.getElementById(pillId);
+  const pillBtn = prefixKey ? document.getElementById(prefixKey + accId + '-' + vmKey) : null;
   if (pillBtn) {
-    let onClass = 'pill-on-autoboot';
-    let offClass = 'pill-off-autoboot';
-    let labelPrefix = '🛡️守护: ';
-    if (featureName === 'keepaliveEnabled') {
-      onClass = 'pill-on-keepalive';
-      offClass = 'pill-off-keepalive';
-      labelPrefix = '⚡保活: ';
-    } else if (featureName === 'taskEnabled') {
-      onClass = 'pill-on-task';
-      offClass = 'pill-off-task';
-      labelPrefix = '🎯任务: ';
-    }
-
     pillBtn.classList.remove(onClass, offClass);
     pillBtn.classList.add(nextVal ? onClass : offClass);
     pillBtn.innerText = labelPrefix + (nextVal ? '开' : '关');
     pillBtn.onclick = () => toggleVmFeature(accId, vmKey, featureName, !nextVal);
   }
 
-  const featureCn = featureName === 'keepaliveEnabled' ? '单机独立保活' : (featureName === 'taskEnabled' ? '单机自动化任务' : '单机自动开机守护');
+  const featureCn = featureName === 'keepaliveEnabled' ? '单机独立保活' : (featureName === 'taskEnabled' ? '单机自动化任务' : featureName);
   try {
     const res = await authFetch(`/api/accounts/${accId}/vm-feature`, {
       method: "PUT",
@@ -1864,7 +1838,6 @@ async function saveYdpcAccount() {
   const password = document.getElementById("ydpc-password") ? document.getElementById("ydpc-password").value.trim() : "";
   const accountType = document.getElementById("ydpc-account-type") ? document.getElementById("ydpc-account-type").value : "main";
   const keepaliveInterval = document.getElementById("ydpc-interval") ? parseInt(document.getElementById("ydpc-interval").value) || 600 : 600;
-  const autoBoot = document.getElementById("ydpc-autoboot") ? document.getElementById("ydpc-autoboot").checked : true;
   const verificationCode = document.getElementById("ydpc-captcha-code") ? document.getElementById("ydpc-captcha-code").value.trim() : "";
   const randomCode = document.getElementById("ydpc-random-code") ? document.getElementById("ydpc-random-code").value.trim() : "";
 
@@ -1879,7 +1852,6 @@ async function saveYdpcAccount() {
     try {
       const existingAcc = accounts.find(a => a.id === accId) || {};
       const features = {
-        autoBoot,
         cagKeepAlive: existingAcc.features?.cagKeepAlive !== false,
         mqttKeepAlive: existingAcc.features?.mqttKeepAlive !== false,
         sohoHeartbeat: existingAcc.features?.sohoHeartbeat !== false,
@@ -1918,7 +1890,7 @@ async function saveYdpcAccount() {
     const res = await authFetch("/api/accounts/ydpc/add", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ name, user, password, accountType, keepaliveInterval, autoBoot, verificationCode, randomCode })
+      body: JSON.stringify({ name, user, password, accountType, keepaliveInterval, verificationCode, randomCode })
     });
     const data = await res.json();
     if (res.ok && data.success) {
@@ -1958,14 +1930,12 @@ function editAccount(accId) {
     const pwdEl = document.getElementById("ydpc-password");
     const typeEl = document.getElementById("ydpc-account-type");
     const intEl = document.getElementById("ydpc-interval");
-    const bootEl = document.getElementById("ydpc-autoboot");
 
     if (nameEl) nameEl.value = acc.name || "";
     if (userEl) userEl.value = acc.user || "";
     if (pwdEl) pwdEl.value = acc.password || "";
     if (typeEl) typeEl.value = acc.accountType || "main";
     if (intEl) intEl.value = String(acc.keepaliveInterval || 600);
-    if (bootEl) bootEl.checked = acc.features?.autoBoot !== false;
 
     openModal("account-modal");
     switchAddAccountPlatform('ydpc');
@@ -2001,29 +1971,9 @@ function editAccount(accId) {
   }
 }
 
-async function bootYdpcVm(accId, userServiceId) {
-  const acc = accounts.find(a => a.id === accId);
-  const targetUsid = userServiceId || (acc?.vms?.[0]?.userServiceId) || (acc?.desktops?.[0]?.userServiceId);
-  showToast("正在执行移动云开机/唤醒指令...", "info");
-  try {
-    const res = await authFetch(`/api/accounts/${accId}/power/poweron`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ userServiceId: targetUsid })
-    });
-    const data = await res.json();
-    if (res.ok && (data.success || data.code === 2000)) {
-      showToast("✅ " + (data.message || "开机指令已生效！"), "success");
-      await loadAccounts(true);
-    } else {
-      const errText = data.error || data.msg || "网关拒绝";
-      const displayErr = errText.startsWith("开机未成功") ? errText : `开机未成功: ${errText}`;
-      showToast(displayErr, "error");
-    }
-  } catch (e) {
-    showToast("请求异常: " + e.message, "error");
-  }
-}
+// 【2026-09-22 用户要求】原 bootYdpcVm()（移动云开机 / 唤醒）已整体删除。
+// 它调用的 /power/poweron 后端链路指向已删除的底层开机引擎 (boot_engine / SC-ZTE 直连开机)。
+// 移动云侧不再提供任何开机入口；如需开机，请在移动云官方 App 中连接一次。
 
 async function pingYdpcCag(accId, userServiceId) {
   const acc = accounts.find(a => a.id === accId);
@@ -2639,6 +2589,15 @@ async function submitManualRedeemOrder() {
 // ==========================================
 // 云电脑电源管理 (开机 / 重启 / 关机)
 // ==========================================
+// 【2026-09-22 用户要求】移动云已移除"开机 / 唤醒"能力（底层开机引擎 boot_engine 已删除），
+// 故在电源管理弹窗中对移动云隐藏该按钮；天翼云不受影响。
+function setPowerBootButtonEnabled(enabled) {
+  const btn = document.getElementById("power-btn-boot");
+  if (!btn) return;
+  btn.style.display = enabled ? "" : "none";
+  btn.disabled = !enabled;
+}
+
 async function openPowerModal(accId, desktopId = '', desktopName = '') {
   const acc = accounts.find(a => a.id === accId);
   if (!acc) return;
@@ -2651,6 +2610,7 @@ async function openPowerModal(accId, desktopId = '', desktopName = '') {
   openModal("power-modal");
 
   if (acc.platform === 'ydpc') {
+    setPowerBootButtonEnabled(false);
     const vms = (acc.vms && acc.vms.length > 0) ? acc.vms : (acc.desktops || []);
     const localList = vms.map(v => ({
       desktopId: String(v.userServiceId),
@@ -2663,6 +2623,7 @@ async function openPowerModal(accId, desktopId = '', desktopName = '') {
   }
 
   // 天翼云
+  setPowerBootButtonEnabled(true);
   const localList = (acc.desktops && acc.desktops.length > 0) ? acc.desktops : (acc.liveMetrics?.desktopName ? [{
     desktopId: acc.liveMetrics?.desktopId || acc.stats?.desktopId || '0',
     desktopName: acc.liveMetrics?.desktopName,
@@ -2743,6 +2704,12 @@ async function executePowerAction(action) {
   }
 
   if (acc && acc.platform === 'ydpc') {
+    // 【2026-09-22 用户要求·已移除】移动云"开机 / 唤醒"能力已随底层开机引擎 (boot_engine) 删除。
+    // 下方关机 / 重启仍走官方 SOHO 接口，保持可用。
+    if (action === 'poweron') {
+      showToast("移动云【开机 / 唤醒】已移除（底层直连开机引擎已删除）。请在移动云官方 App 中连接一次以开机。", "error");
+      return;
+    }
     showToast(`正在向移动云下发【${actionName}】指令...`, "info");
     try {
       const res = await authFetch(`/api/accounts/${accId}/power/${action}`, {

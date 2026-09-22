@@ -11,7 +11,8 @@ data/*
 
 # 临时文件与日志
 *.log
-test_*.js
+# 仅忽略仓库根目录下的临时调试脚本；正式回归测试位于 tests/ 且必须纳入版本控制
+/test_*.js
 *.tmp
 .DS_Store
 Thumbs.db
@@ -19,3 +20,9 @@ Thumbs.db
 
 # 本地旧版前端备份 (不入库)
 app/static_backup_v1/
+
+# 本地分析产物与会话还原记录 (含敏感信息，绝不入库)
+analysis/
+
+# WorkBuddy 本地项目数据 (记忆 / 技能等，非代码，不入库)
+.workbuddy/

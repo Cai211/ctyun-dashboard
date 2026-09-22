@@ -781,6 +781,50 @@ const authManager = new AuthManager({
 });
 
 // ==========================================================
+// 开关语义的单一权威入口 (暗线 A 的结构性修复)
+// ----------------------------------------------------------
+// 历史缺陷：keepaliveEnabled / taskEnabled / cloudHang / autoBootEnabled 四个字段
+// 在多处被各自读取、语义互相渗透，导致同一个耦合在 2026-09-14 与 2026-09-21
+// 被两次宣称"彻底解耦"却两次复发。
+// 现在规定：
+//   - 保活 (keepAlive) 只由 keepAlive + desktop.keepaliveEnabled 决定；
+//   - 任务 (sign / aiChat / cloudHang) 只由 features.<task> + desktop.taskEnabled 决定；
+//   - autoBoot 只决定"是否代为开机"，不参与任何"任务是否执行"的判定。
+//     （2026-09-22 起：移动云侧 autoBoot / 底层开机引擎已整体删除；此处仅对天翼云 desktop 仍成立。）
+// 任何判定点都必须调用本函数，不得再就地读取原始字段。
+// ==========================================================
+const TASK_CN_NAME = { keepAlive: '常态保活', sign: '登录打卡', aiChat: 'AI 对话', cloudHang: '1 小时挂机' };
+
+// 【字段名映射 · 本次源审新发现 #43】历史代码里"登录打卡"的账号级开关字段名是
+// autoSign（前端 toggleFeature('...','autoSign')、默认值 {keepAlive,autoSign,aiChat,cloudHang,autoRedeem}、
+// 备份迁移判断都用 autoSign），而"任务类型常量"叫 'sign'。二者不一致。
+// 若直接用 f[taskType] 去读，'sign' 会永远命中 undefined，导致"账号级打卡开关"彻底失效 ——
+// 用户关掉打卡开关后任务仍会执行，正是"开关不起作用"类投诉的又一根源。
+// 因此此处显式建立 任务类型 -> 功能字段 的映射，杜绝名称漂移。
+const TASK_FEATURE_KEY = { keepAlive: 'keepAlive', sign: 'autoSign', aiChat: 'aiChat', cloudHang: 'cloudHang' };
+
+function resolveTaskEnabled(account, desktop, taskType) {
+  const label = TASK_CN_NAME[taskType] || taskType;
+  if (!account) return { enabled: false, reason: '账号不存在' };
+  if (account.enabled === false) return { enabled: false, reason: '账号已停用' };
+
+  const f = account.features || {};
+  const featureKey = TASK_FEATURE_KEY[taskType] || taskType;
+
+  if (taskType === 'keepAlive') {
+    if (f.keepAlive === false) return { enabled: false, reason: '账号级【常态保活】开关已关闭' };
+    if (desktop && desktop.keepaliveEnabled === false) return { enabled: false, reason: '该云电脑的【独立保活】开关已关闭' };
+    return { enabled: true, reason: '' };
+  }
+
+  // 所有"任务类"开关一致：只看账号级任务开关与该机任务开关，
+  // 保活开关 (keepAlive / keepaliveEnabled) 对任务是否执行【零影响】。
+  if (f[featureKey] === false) return { enabled: false, reason: `账号级【${label}】开关已关闭` };
+  if (desktop && desktop.taskEnabled === false) return { enabled: false, reason: `该云电脑的【🎯 任务】开关已关闭，已尊重用户意图跳过${label}` };
+  return { enabled: true, reason: '' };
+}
+
+// ==========================================================
 // 生产级天翼云原生客户端（严格实现 CtYun C# 原生保活心跳与协议）
 // ==========================================================
 class CtYunClient {
@@ -824,9 +868,19 @@ class CtYunClient {
     this.isTaskHanging = false; // 是否正在执行 Scheduler 精准调度的 1 小时挂机任务
     this.hangRetryTimer = null; // 挂机任务自动重试定时器 (未达标自愈续跑)
     this.hangRetryCount = 0;    // 当日挂机重试次数 (上限 24 次)
+    this.hangReconnectCount = 0;      // 单次 runHangTask 内的"经证据鉴别后允许重连"次数 (上限 3)
+    this.hangUnverifiedStreak = 0;    // 连续"取不到证据"的次数：达到阈值后退避更久，避免任何形式的顶人风暴
+    this.signVerifyTimer = null;      // 打卡"待官方确认"复检定时器
+    this.signVerifyPendingSince = null;
+    this.signVerifyRound = 0;
   }
 
   // 检测今日挂机 1 小时任务是否已达成 (严格依据今日真实达成状态)
+  // 开关语义统一入口：供本文件与 app/tasks/* 共用，杜绝各处就地读取原始字段
+  resolveTask(taskType, desktop = null) {
+    return resolveTaskEnabled(this.account, desktop, taskType);
+  }
+
   isTodayHangTaskCompleted() {
     const todayStr = getBeijingDateOnly();
     // 1. 优先依据官方任务中心最新进度
@@ -898,24 +952,122 @@ class CtYunClient {
     this.hangRetryCount = 0;
   }
 
-  // 挂机中断来源证据化鉴别：观察 90 秒官方计时是否继续增长
-  // 真实客户端正在使用 → 官方计时持续增长 (real_client)；己方残留会话/网关误报 → 计时冻结 (false_alarm)
-  async diagnoseHangInterruption(onLog = console.log, targetName = '云电脑') {
+  // ==========================================================
+  // 登录打卡的"待官方确认"复检机制 (暗线 C 的结构性修复)
+  // ----------------------------------------------------------
+  // 历史缺陷：打卡在固定 300 秒观察窗内未获官方确认即结束，且返回 success:true，
+  // 造成"日志说成功、积分实际未到"。用户实测官方落账延迟约 14 分钟，远大于 5 分钟窗口。
+  // 修复原则：窗口只用于【何时释放通道】，绝不作为【成败的判定依据】。
+  // 判定一律以官方任务中心为准，通过跨分钟多次复检收敛 —— 复检期间绝不重新认领，因此不会顶人。
+  // ==========================================================
+  isSignTaskDone() {
+    const t = this.metrics.officialTasks?.find(x => x.name.includes('登录AI云电脑') || x.name.includes('登录'));
+    return !!(t && (t.status === 2 || (t.total > 0 && t.current >= t.total)));
+  }
+
+  clearSignVerify() {
+    if (this.signVerifyTimer) {
+      clearTimeout(this.signVerifyTimer);
+      this.signVerifyTimer = null;
+    }
+    this.signVerifyPendingSince = null;
+    this.signVerifyRound = 0;
+  }
+
+  /**
+   * 认领已下发、官方尚未确认时调用：安排跨分钟复检，只读官方状态，绝不再次认领。
+   * @param {(src:string,msg:string,lvl:string)=>void} onLog 日志回调
+   * @param {number} totalWaitMinutes 观察总时长（默认 45 分钟，覆盖实测约 14 分钟的落账延迟）
+   */
+  scheduleSignVerify(onLog = console.log, totalWaitMinutes = 45) {
+    const accName = this.account.name || this.account.user;
+    if (!this.signVerifyPendingSince) this.signVerifyPendingSince = Date.now();
+    if (this.signVerifyTimer) return;
+
+    const stepMin = 5;
+    this.signVerifyRound = this.signVerifyRound || 0;
+    const elapsedMin = Math.floor((Date.now() - this.signVerifyPendingSince) / 60000);
+
+    if (elapsedMin >= totalWaitMinutes) {
+      onLog('Sign', `[${accName}] ⏳ 打卡复检已满 ${totalWaitMinutes} 分钟，官方任务中心仍未确认【登录AI云电脑】达成。本次打卡判定为【未达成】——不再重试认领，等待用户客户端登录或下一次调度。`, 'warning');
+      this.clearSignVerify();
+      return;
+    }
+
+    this.signVerifyRound++;
+    onLog('Sign', `[${accName}] 🕓 打卡认领已下发，官方尚未确认 (已等待约 ${elapsedMin} 分钟)。安排 ${stepMin} 分钟后复检官方任务中心 (第 ${this.signVerifyRound} 次，最长观察 ${totalWaitMinutes} 分钟；复检期间不重新认领，不会打扰客户端)。`, 'info');
+
+    this.signVerifyTimer = setTimeout(async () => {
+      this.signVerifyTimer = null;
+      try {
+        const r = await this.refreshOfficialTasks();
+        if (!r || r.ok === false) {
+          onLog('Sign', `[${accName}] 打卡复检未能读到官方任务中心 (${(r && r.reason) || '原因未知'})，本次不判定，稍后继续复检。`, 'warning');
+          this.scheduleSignVerify(onLog, totalWaitMinutes);
+          return;
+        }
+        if (this.isSignTaskDone()) {
+          const nowStr = getBeijingTimeString();
+          this.account.stats.lastSignTime = nowStr;
+          saveConfig(appConfig);
+          onLog('Sign', `🎉 官方任务中心已确认【登录AI云电脑】达成 (+100积分)！打卡完成时间 ${nowStr}。`, 'success');
+          sendAccountNotification(this.account, `✅ 登录打卡达成 - ${accName}`, `账号【${accName}】今日登录AI云电脑任务已完成，100 积分已到账！`);
+          this.clearSignVerify();
+          return;
+        }
+        this.scheduleSignVerify(onLog, totalWaitMinutes);
+      } catch (e) {
+        onLog('Sign', `[${accName}] 打卡复检异常: ${e.message}，稍后继续。`, 'warning');
+        this.scheduleSignVerify(onLog, totalWaitMinutes);
+      }
+    }, stepMin * 60 * 1000);
+  }
+
+  /**
+   * 挂机中断来源证据化鉴别。
+   *
+   * 判定方向的不对称性是本函数的全部意义所在：
+   *   - 误判为 real_client  → 代价只是我们自己多等 10 分钟 (不打扰任何人)
+   *   - 误判为 false_alarm  → 代价是把正在使用云电脑的真实用户顶下线 (不可接受)
+   * 因此凡"取不到可信证据"一律返回 'unverified'，并由调用方按 real_client 处理。
+   * 这正是历史上"没有证据被当成没有用户"的反面。
+   */
+  async diagnoseHangInterruption(onLog = console.log, targetName = '云电脑', preRefresh = null) {
     const accName = this.account.name || this.account.user;
     const getUsage = () => {
       const t = this.metrics.officialTasks?.find(x => x.name.includes('使用1小时'));
       return t ? (t.current || 0) : 0;
     };
-    await this.refreshOfficialTasks();
+
+    const r1 = preRefresh || await this.refreshOfficialTasks();
+    if (!r1 || r1.ok === false) {
+      appendLog('Hang', `[${accName}][${targetName}] 🔎 无法鉴别中断来源：官方任务中心不可读 (${(r1 && r1.reason) || '原因未知'})。取不到证据即不得重新认领，按"可能有真机用户"处理。`, 'warning');
+      return 'unverified';
+    }
     if (this.isTodayHangTaskCompleted()) return 'completed';
+
     const before = getUsage();
-    onLog('Hang', `[${targetName}] 🔎 正在鉴别中断来源 (观察 90 秒官方计时是否继续增长)...`, 'info');
-    await new Promise(r => setTimeout(r, 90000));
-    await this.refreshOfficialTasks();
-    if (this.isTodayHangTaskCompleted()) return 'completed';
-    const after = getUsage();
-    appendLog('Hang', `[${accName}][${targetName}] 中断鉴别结果: 90 秒内官方计时 ${before}s → ${after}s (${after > before ? '持续增长=真实客户端' : '冻结=误报'})`, 'info');
-    return (after - before) >= 60 ? 'real_client' : 'false_alarm';
+    onLog('Hang', `[${targetName}] 🔎 正在鉴别中断来源 (观察约 90 秒，检查官方计时是否继续增长；当前 ${before}s)...`, 'info');
+
+    // 两次采样，取最大增量，避免官方按分钟粒度落账时恰好错过一次跳变
+    let maxSeen = before;
+    for (let i = 0; i < 2; i++) {
+      await new Promise(r => setTimeout(r, 45000));
+      const r = await this.refreshOfficialTasks();
+      if (!r || r.ok === false) {
+        appendLog('Hang', `[${accName}][${targetName}] 🔎 鉴别过程第 ${i + 1} 次取值失败 (${(r && r.reason) || '原因未知'})，无法形成结论，按"可能有真机用户"处理。`, 'warning');
+        return 'unverified';
+      }
+      if (this.isTodayHangTaskCompleted()) return 'completed';
+      maxSeen = Math.max(maxSeen, getUsage());
+    }
+
+    const delta = maxSeen - before;
+    // 阈值取 30 秒：本会话此时已断开，官方计时若仍在增长即说明另有他人在使用。
+    // 我们自身会话的延迟落账也会表现为增长 —— 同样导向"让位"，属于安全方向。
+    const verdict = delta >= 30 ? 'real_client' : 'false_alarm';
+    appendLog('Hang', `[${accName}][${targetName}] 中断鉴别结果: 90 秒内官方计时 ${before}s → ${maxSeen}s (增量 ${delta}s)，判定 = ${verdict === 'real_client' ? '真实客户端正在使用 (计时持续增长)，必须让位' : '无人在用 (计时冻结)，可安全续连'}`, 'info');
+    return verdict;
   }
 
   // 用户点击浏览器访问云电脑时调用：立即主动断开后台保活连接，并保持避让让位
@@ -1713,7 +1865,7 @@ class CtYunClient {
   checkExternalPowerOn(desktop) {
     if (!desktop) return;
     const isRunning = desktop.useStatusText === '运行中' || desktop.useStatus == 25;
-    if (isRunning && this.account.features && this.account.features.keepAlive === false) {
+    if (isRunning && !this.resolveTask('keepAlive').enabled) {
       this.account.features.keepAlive = true;
       this.account.manualShutdown = false;
       this.account.stats = this.account.stats || {};
@@ -1724,8 +1876,23 @@ class CtYunClient {
     }
   }
 
+  /**
+   * 刷新官方任务中心与积分。
+   *
+   * 【为什么返回可信度】历史缺陷 (暗线 D)：本函数原先 catch(e){} 静默吞错，
+   * 调用方拿到的是"过期的 officialTasks 快照"，却无法区分
+   * "官方确认未达成" 与 "根本没取到数据"。此前多轮"假成功/假失败"都源于这一不可区分性。
+   * 现在返回 { ok, reason }：ok=false 表示本次数据不可信，任何"判定"都必须放弃而不是猜。
+   */
   async refreshOfficialTasks() {
-    if (!this.loginInfo) return;
+    if (!this.loginInfo) return { ok: false, reason: '账号尚未登录，无法读取官方任务中心' };
+
+    const statKeys = ['lastSignTime', 'lastAiChatTime', 'lastHangTime', 'hangMinutesToday', 'points'];
+    const snapStats = () => JSON.stringify(statKeys.map(k => this.account?.stats?.[k] ?? null));
+    const beforeStats = snapStats();
+
+    let ok = false;
+    let reason = '';
 
     try {
       const taskRes = await (await fetchWithTimeout('https://desk.ctyun.cn/selforder/api/marketing/userPoints/getTaskList', {
@@ -1734,6 +1901,7 @@ class CtYunClient {
 
       if (taskRes.code === 40010 || String(taskRes.msg || '').includes('登录信息已过期') || String(taskRes.msg || '').includes('会话已过期')) {
         await this.renewToken().catch(() => {});
+        reason = `凭据过期 (code=${taskRes.code || taskRes.msg})`;
       }
 
       if (taskRes.code === 0 && taskRes.data) {
@@ -1774,6 +1942,9 @@ class CtYunClient {
             }
           }
         }
+        ok = true;
+      } else if (!reason) {
+        reason = `任务中心返回异常 code=${taskRes.code} msg=${taskRes.msg || '(无)'}`;
       }
 
       const pointRes = await (await fetchWithTimeout('https://desk.ctyun.cn/selforder/api/marketing/userPoints/getUserPoints', {
@@ -1781,15 +1952,29 @@ class CtYunClient {
       })).json();
 
       if (pointRes.code === 0 && Array.isArray(pointRes.data) && pointRes.data.length > 0) {
-        // 核心修复：pointRes.data 数组可能包含两项，一项为 willOutDate: true 即将过期的子积分（如100分），一项为真实总积分（如900分）
-        // 优先精准提取非即将过期（willOutDate != true）的主账户可用总积分项；若都无标识则取数值最大项！
-        const validItem = pointRes.data.find(p => !p.willOutDate && p.pointType === 1) || 
+        // pointRes.data 数组可能包含两项，一项为 willOutDate: true 即将过期的子积分（如100分），一项为真实总积分（如900分）
+        // 优先精准提取非即将过期（willOutDate != true）的主账户可用总积分项；若都无标识则取数值最大项
+        const validItem = pointRes.data.find(p => !p.willOutDate && p.pointType === 1) ||
                           pointRes.data.reduce((max, cur) => ((cur.points || 0) > (max.points || 0) ? cur : max), pointRes.data[0]);
         this.metrics.userPoints = validItem ? (validItem.points || 0) : 0;
         this.account.stats.points = this.metrics.userPoints;
+        ok = true;
+      } else if (!reason) {
+        reason = `积分接口返回异常 code=${pointRes.code}`;
       }
-      saveConfig(appConfig);
-    } catch (e) {}
+    } catch (e) {
+      reason = `官方任务中心访问失败: ${e.message}`;
+    }
+
+    // 仅在统计字段确实发生变化时落盘 (原先每次调用都 saveConfig，在容器挂载 NAS 卷场景下为高频无效写盘)
+    if (snapStats() !== beforeStats) {
+      try { saveConfig(appConfig); } catch (e) { /* 落盘失败不影响本次判定 */ }
+    }
+
+    if (!ok) {
+      appendLog('System', `[${this.account?.name || this.account?.user || ''}] ⚠️ 官方任务中心刷新未取得有效数据 (${reason})。本次结果不可信，系统不会据此判定任何任务成败。`, 'warning');
+    }
+    return { ok, reason };
   }
 
   async getRewards() {
@@ -1888,6 +2073,10 @@ class CtYunClient {
       let wsConnectedAt = 0;
       let goalAchieved = false; // 目标任务 (如登录AI云电脑) 是否已获得官方确认
       let clientPresenceSignal = false; // 官方客户端在席信令 (Type 119/120/137)：收到即代表真机用户接入
+      // 诊断埋点 (零行为改动)：记录会话握手阶段的关键事实，供断开时判断"真机抢占"还是"网络抖动"
+      let handshakeDone = false; // 是否收到过 Type 103 并完成 118 身份上报
+      let claimSent = false;     // 是否已发送 Type 112/104 独占认领
+      let redqCount = 0;         // REDQ 挑战应答累计次数
 
       const endSession = (reason) => {
         if (cycleDone) return;
@@ -2021,6 +2210,7 @@ class CtYunClient {
 
           if (hex.startsWith('52454451')) {
             const nowStr = getBeijingTimeOnly();
+            redqCount++;
             appendLog('Heartbeat', `[${accName}][${desktopName}] 收到服务端保活校验 REDQ (${buf.length}B)`, 'info');
 
             const responseBuf = this.encryptor.execute(buf);
@@ -2058,6 +2248,7 @@ class CtYunClient {
             }
 
             if (type === 103) {
+              handshakeDone = true;
               appendLog('Heartbeat', `[${accName}][${desktopName}] 收到云电脑 103 认证，正在上报 118 用户身份...`, 'info');
               const userPayload = Buffer.from(JSON.stringify({
                 type: 1,
@@ -2121,6 +2312,7 @@ class CtYunClient {
                   msgBuf104.writeUInt16LE(104, 0);
                   msgBuf104.writeUInt32LE(0, 2);
                   safeSend(msgBuf104);
+                  claimSent = true;
                 } catch (e) {}
               } else {
                 appendLog('Heartbeat', `[${accName}][${desktopName}] 脉冲旁观者模式已激活：不认领桌面会话 (无 112/104)，官方客户端随时接入永不被踢。`, 'info');
@@ -2202,21 +2394,40 @@ class CtYunClient {
         const reasonStr = String(reason || '');
         const heldSec = wsConnectedAt ? Math.floor((Date.now() - wsConnectedAt) / 1000) : 0;
 
+        // 诊断埋点 (零行为改动)：非自身主动关闭时，完整留存判定「真机抢占 vs 网络抖动」所需的全部证据。
+        // 若本行显示"在席信令=无 且 code 未达 4000"，却判定为网络抖动而重连，即为 45 秒循环踢人的直接证据。
+        if (!isClosingSelf) {
+          appendLog('Heartbeat', `[${accName}][${desktopName}] [断开诊断] code=${code} reason="${reasonStr || '(空)'}" 保持=${heldSec}s | 在席信令(119/120/137)=${clientPresenceSignal ? '有' : '无'} 103握手=${handshakeDone ? '已完成' : '未完成'} 112/104认领=${claimSent ? '已发送' : '未发送'} REDQ应答=${redqCount}次 | 模式=${isHangMode ? '挂机认领' : (goalTaskName || '脉冲旁观')}`, 'warning');
+        }
+
         if (isClosingSelf) {
           appendLog('Heartbeat', `[${accName}][${desktopName}] 保活长连接正常轮转关闭 (${code} - ${reason || '周期重连'})`, 'info');
-        } else if (code >= 4000 || reasonStr.includes('preempt') || reasonStr.includes('kick') || reasonStr.includes('conflict')) {
+          return;
+        }
+
+        // 证据充分：网关明确抢占 (code>=4000 / reason 含 preempt|kick|conflict)
+        if (code >= 4000 || reasonStr.includes('preempt') || reasonStr.includes('kick') || reasonStr.includes('conflict')) {
           appendLog('Heartbeat', `[${accName}][${desktopName}] 收到网关抢占信令 (${code})，确认为官方客户端接入信号。`, 'info');
           endSession('Preempted by Client');
           return;
-        } else if (clientPresenceSignal) {
-          // 断开前收到过 Type 119/120/137 在席信令：这是官方客户端接入导致的踢线，绝非网络抖动，绝不盲目重连争抢！
+        }
+
+        // 证据充分：断开前收到过 Type 119/120/137 在席信令 → 真机接入导致的踢线
+        if (clientPresenceSignal) {
           appendLog('Heartbeat', `[${accName}][${desktopName}] 断开前收到官方客户端在席信令，判定为真机接入抢占 (状态码: ${code}，已保持 ${heldSec} 秒)。`, 'info');
           endSession('Preempted by Client');
           return;
-        } else {
-          appendLog('Heartbeat', `[${accName}][${desktopName}] 通道被网关断开 (状态码: ${code}，已保持 ${heldSec} 秒)，属网络/网关抖动，挂机将自动重连。`, 'info');
         }
-        endSession('Closed');
+
+        // ── 兜底路径：断开但【没有任何】客户端在席证据 ──────────────────────────────
+        // 历史缺陷 (暗线 B)：此处原先直接判定为「网络/网关抖动」，随后无条件 45 秒重连续跑，
+        // 导致真实用户被反复顶掉。根因是"没有证据"被当成了"没有用户"的证据。
+        // 现在改为产出中性的 'Unverified Channel Close'，由上层 runHangTask 执行证据鉴别
+        // (观察官方计时是否增长) 后再决定是否允许重新认领。
+        // 在席信令机制本身的可靠性早在 2026-09-09 就被确认为"常常监听不到"，
+        // 因此本分支必须假定"可能有真机用户"，而不是假定"没有"。
+        appendLog('Heartbeat', `[${accName}][${desktopName}] 通道被网关断开 (状态码: ${code}，已保持 ${heldSec} 秒)，但未收到任何客户端在席证据 (无 119/120/137 且 code 未达 4000)。此事不构成"无人在用"的结论，交由上层做证据鉴别后再决定是否重连。`, 'warning');
+        endSession('Unverified Channel Close');
       });
     });
   }
@@ -2235,12 +2446,34 @@ class CtYunClient {
       this.hangRetryTimer = null;
     }
 
+    // 0. 账号级挂机开关：统一入口判定 (暗线 A —— 保活开关对任务零影响)
+    const accHangGate = this.resolveTask('cloudHang');
+    if (!accHangGate.enabled) {
+      this.clearHangRetry();
+      onLog('Hang', `[${accName}] ${accHangGate.reason}，本次挂机任务自动跳过。`, 'info');
+      return { success: true, isCompleted: false, message: accHangGate.reason };
+    }
+
+    // 0.1 与登录打卡认领会话互斥 (新发现 #33)：这两处曾可能同时下发 Type 112/104，
+    //     造成互相顶掉且官方计时不累加。打卡认领进行中时挂机一律让位并稍后重试。
+    if (this._signSessionActive) {
+      onLog('Hang', `[${accName}] 登录打卡认领会话正在进行中，挂机任务主动让位等待，避免双认领冲突。`, 'info');
+      this.scheduleHangRetry(onLog);
+      return { success: true, isCompleted: false, message: '打卡认领进行中，挂机让位' };
+    }
+
     // 1. 检查今日挂机 1 小时是否已达成
-    await this.refreshOfficialTasks();
+    const initRefresh = await this.refreshOfficialTasks();
     if (this.isTodayHangTaskCompleted()) {
       this.clearHangRetry();
       onLog('Hang', `[${accName}] ✅ 今日云电脑 1 小时挂机任务已达成 (+100积分)，无需重复执行。`, 'success');
       return { success: true, isCompleted: true, message: '今日挂机时长已满 60 分钟' };
+    }
+    // 官方状态不可读时不得盲目开抢：认领会顶掉真实用户，而"不知道是否已完成"不构成执行理由
+    if (initRefresh && initRefresh.ok === false) {
+      onLog('Hang', `[${accName}] 官方任务中心暂不可读 (${initRefresh.reason})，无法确认今日达成状态。为避免盲目认领抢占，本次挂机暂缓。`, 'warning');
+      this.scheduleHangRetry(onLog);
+      return { success: true, isCompleted: false, message: '官方状态不可读，本次挂机暂缓' };
     }
 
     // 2. 检查用户与客户端避让状态 (避让后自动安排续跑，绝不静默丢弃今日任务)
@@ -2259,12 +2492,18 @@ class CtYunClient {
     // 3. 标记正在执行挂机任务，让后台脉冲循环主动让位
     this.isTaskHanging = true;
     this.metrics.isTaskHanging = true;
+    this.hangReconnectCount = 0; // 单次 runHangTask 内"经证据鉴别后允许重连"的次数
     if (this.endCurrentSession) {
       this.endCurrentSession('Yield to Scheduled Hang Task');
     }
 
+    // 硬性总时长上限：确保本函数在任何分支组合下都必然返回，
+    // 杜绝历史上 attempt-- 使 MAX_ROUNDS 失效后可能出现的无限运行。
+    const hangDeadline = Date.now() + 100 * 60 * 1000;
+    const deadlineExceeded = () => Date.now() > hangDeadline;
+
     try {
-      // 4. 获取目标云电脑并确保开机 (优选已在运行的主机，其次任务+保活双开的主机，避免挂机落空)
+      // 4. 获取目标云电脑并确保开机 (优选已在运行的主机，避免挂机落空)
       const desktops = await this.getDesktops();
       if (!desktops || desktops.length === 0) {
         onLog('Hang', `[${accName}] 账号名下暂无可用云电脑，无法执行挂机任务。`, 'warning');
@@ -2273,10 +2512,11 @@ class CtYunClient {
       }
 
       const isDesktopRunning = (d) => d && (d.useStatusText === '运行中' || d.useStatus == 25);
-      const taskOnDesktops = desktops.filter(d => d.taskEnabled !== false);
+      // 统一开关入口：挂机是否可作用于该机，只由 cloudHang + desktop.taskEnabled 决定
+      const taskOnDesktops = desktops.filter(d => this.resolveTask('cloudHang', d).enabled);
       if (taskOnDesktops.length === 0) {
-        onLog('Hang', `[${accName}] 账号名下所有云电脑的【🎯 任务开关】均已关闭，本次挂机任务自动跳过。`, 'info');
-        return { success: true, isCompleted: false, message: '名下所有云电脑均已关闭任务开关' };
+        onLog('Hang', `[${accName}] 账号名下所有云电脑的挂机任务均被开关关闭，本次挂机任务自动跳过。`, 'info');
+        return { success: true, isCompleted: false, message: '名下所有云电脑均已关闭挂机任务开关' };
       }
 
       const runningDesktops = taskOnDesktops.filter(d => isDesktopRunning(d));
@@ -2309,15 +2549,28 @@ class CtYunClient {
       const USER_INTENT_STOP_REASONS = ['User Disabled Task on Active Desktop', 'User Disabled Hang Mode', 'Yield to External Client', 'Web User Active'];
       let attempt = 0;
       let lastResult = null;
-      let transientRetries = 0;   // 网络闪断自动重连预算
-      let falseAlarmRetries = 0;  // 占用误报自动重连预算
+      this.hangNoClaimRetries = 0; // 未建立会话 (未下发 112/104) 的快速重试计数：无顶人风险
       const MAX_ROUNDS = 4; // 1 轮主挂机 (3600s) + 最多 3 轮 10 分钟尾差补挂
       while (attempt < MAX_ROUNDS) {
         attempt++;
 
-        // 5.0 账号级挂机总开关实时校验：用户关闭【⏱️ 云电脑挂机1小时】后，任何轮次 (含补挂/闪断重连) 立即终止
-        if (this.account.features?.cloudHang === false) {
-          onLog('Hang', `[${accName}][${targetName}] 账号级【挂机1小时】开关已被用户关闭，挂机${attempt > 1 ? '补挂/重连' : ''}立即终止。`, 'info');
+        // 5.0 硬性总时长上限：无论何种分支组合，本次挂机都必须在有限时间内返回
+        if (deadlineExceeded()) {
+          onLog('Hang', `[${accName}][${targetName}] 本次挂机已达硬性时长上限 (100 分钟)，主动收束，交回定时续跑。`, 'warning');
+          this.scheduleHangRetry(onLog);
+          break;
+        }
+
+        // 5.0.1 账号级挂机开关实时校验 (统一入口，暗线 A)
+        const accGateNow = this.resolveTask('cloudHang');
+        if (!accGateNow.enabled) {
+          onLog('Hang', `[${accName}][${targetName}] ${accGateNow.reason}，挂机${attempt > 1 ? '补挂/重连' : ''}立即终止。`, 'info');
+          break;
+        }
+        // 5.0.2 打卡认领会话进行中：让位，避免双 112/104 认领互相顶掉 (#33)
+        if (this._signSessionActive) {
+          onLog('Hang', `[${accName}][${targetName}] 登录打卡认领会话正在进行，挂机本轮让位终止。`, 'info');
+          this.scheduleHangRetry(onLog);
           break;
         }
         // 5.1 用户浏览器正在操作云电脑：挂机立即让位终止，绝不反抢
@@ -2331,17 +2584,20 @@ class CtYunClient {
           onLog('Hang', `[${accName}][${targetName}] 官方客户端避让冷却期内 (剩余 ${waitMin} 分钟)，挂机${attempt > 1 ? '补挂' : ''}终止。`, 'info');
           break;
         }
-        // 5.3 单机独立开关实时校验：用户在挂机途中关闭该主机的【🎯任务】开关，立即尊重用户意图终止
+        // 5.3 单机开关实时校验 (统一入口，暗线 A)
         const freshTarget = (this.account.desktops || []).find(d => String(d.objId || d.desktopId) === targetId);
-        if (freshTarget && freshTarget.taskEnabled === false) {
-          onLog('Hang', `[${accName}][${targetName}] 检测到该主机的【🎯任务】开关已被用户关闭，挂机立即终止。`, 'info');
-          break;
+        if (freshTarget) {
+          const freshGate = this.resolveTask('cloudHang', freshTarget);
+          if (!freshGate.enabled) {
+            onLog('Hang', `[${accName}][${targetName}] ${freshGate.reason}，挂机立即终止。`, 'info');
+            break;
+          }
         }
 
         const roundSec = attempt === 1 ? 3600 : 600;
         lastResult = await this.runDesktopKeepAliveSession(mainDesktop, true, roundSec);
 
-        await this.refreshOfficialTasks();
+        const postRefresh = await this.refreshOfficialTasks();
         if (this.isTodayHangTaskCompleted()) break;
 
         const reasonStr = String((lastResult && lastResult.reason) || '');
@@ -2352,7 +2608,7 @@ class CtYunClient {
           break;
         }
 
-        // 5.5 网关抢占信令 (code>=4000)：官方客户端接入的确凿证据，让位 10 分钟
+        // 5.5 网关抢占信令 (code>=4000 / 在席信令)：官方客户端接入的确凿证据，让位 10 分钟
         if (reasonStr === 'Preempted by Client') {
           if (!this.isWebUserActive && Date.now() >= this.externalYieldUntil) {
             this.yieldToExternalClient(10);
@@ -2361,40 +2617,62 @@ class CtYunClient {
           break;
         }
 
-        // 5.6 API 占用信令：先做 90 秒证据鉴别 (真实客户端使用时官方计时持续增长；己方残留会话/误报则计时冻结)
-        if (reasonStr === 'occupied') {
-          const verdict = await this.diagnoseHangInterruption(onLog, targetName);
-          if (verdict === 'completed') break;
-          if (verdict === 'real_client') {
-            if (!this.isWebUserActive && Date.now() >= this.externalYieldUntil) {
-              this.yieldToExternalClient(10);
-              onLog('Hang', `[${targetName}] ⚠️ 确认官方客户端正在使用 (中断后官方计时仍在增长)，已让位避让 10 分钟，绝不反抢！`, 'warning');
-            }
-            break;
-          }
-          falseAlarmRetries++;
-          if (falseAlarmRetries > 6) {
-            onLog('Hang', `[${targetName}] 占用误报重试已达上限，转入定时自动续跑。`, 'info');
+        // 5.6 未建立会话即未认领：从未下发 112/104，不存在顶人风险，允许有限次快速重试
+        if (reasonStr === 'no_gateway') {
+          this.hangNoClaimRetries = (this.hangNoClaimRetries || 0) + 1;
+          if (this.hangNoClaimRetries > 3) {
+            onLog('Hang', `[${targetName}] 网关迟迟未分配通道 (已尝试 ${this.hangNoClaimRetries} 次)，转入定时自动续跑。`, 'info');
             this.scheduleHangRetry(onLog);
             break;
           }
-          attempt--;
-          onLog('Hang', `[${targetName}] 🔍 占用信令为误报 (官方计时未增长，非真实客户端)，60 秒后立即重连续挂 (${falseAlarmRetries}/6)...`, 'info');
-          await new Promise(r => setTimeout(r, 60000));
+          onLog('Hang', `[${targetName}] 视讯网关尚未分配通道 (本次未认领桌面，无顶人风险)，30 秒后重试 (${this.hangNoClaimRetries}/3)...`, 'info');
+          await new Promise(r => setTimeout(r, 30000));
           continue;
         }
 
-        // 5.7 网络闪断/Socket 错误/网关未就绪：短暂退避自动重连续跑，绝不误判为客户端登录！
-        if (reasonStr === 'Closed' || reasonStr === 'Socket Error' || reasonStr === 'no_gateway') {
-          transientRetries++;
-          if (transientRetries > 10) {
-            onLog('Hang', `[${targetName}] 网络闪断重试已达上限，转入定时自动续跑。`, 'info');
+        // ─────────────────────────────────────────────────────────────────────
+        // 5.7 统一的中断处置：凡"已被断开、可能重连"的情形，一律先做证据鉴别再决定是否认领。
+        //     历史缺陷 (暗线 B)：'Closed' 与 'Socket Error' 曾被直接判定为「网络/网关抖动」，
+        //     并在 45 秒后无条件重新认领 → 把真实用户反复顶下线。
+        //     根因是"没有在席证据"被当成了"没有用户"。此处必须假定可能有真人。
+        // ─────────────────────────────────────────────────────────────────────
+        const RECONNECTABLE_REASONS = ['occupied', 'Unverified Channel Close', 'Closed', 'Socket Error'];
+        if (RECONNECTABLE_REASONS.includes(reasonStr)) {
+          const verdict = await this.diagnoseHangInterruption(onLog, targetName, postRefresh);
+          if (verdict === 'completed') break;
+
+          // real_client / unverified 一律不得重新认领：
+          //   real_client = 有真人在使用 (官方计时仍在增长)
+          //   unverified  = 取不到可信证据 → 按"可能有真人"处理 (判定方向不对称，见函数注释)
+          if (verdict === 'real_client' || verdict === 'unverified') {
+            if (verdict === 'unverified') {
+              this.hangUnverifiedStreak++;
+              if (this.hangUnverifiedStreak >= 3) {
+                onLog('Hang', `[${targetName}] 已连续 ${this.hangUnverifiedStreak} 次无法取得可信证据，为杜绝任何形式的抢占，本次挂机转入长冷却 (30 分钟)。`, 'warning');
+                this.yieldToExternalClient(30);
+                break;
+              }
+            } else {
+              this.hangUnverifiedStreak = 0;
+            }
+            if (!this.isWebUserActive && Date.now() >= this.externalYieldUntil) {
+              this.yieldToExternalClient(10);
+              onLog('Hang', `[${targetName}] ⚠️ ${verdict === 'real_client' ? '证据显示官方客户端正在使用 (计时仍增长)' : '取不到可信证据 (按可能存在客户端处理)'}，已让位避让 10 分钟，绝不反抢！`, 'warning');
+            }
+            break;
+          }
+
+          // 到此 verdict === 'false_alarm'：官方计时冻结，确认无人在用，允许重连
+          this.hangUnverifiedStreak = 0;
+          this.hangReconnectCount++;
+          if (this.hangReconnectCount > 3) {
+            onLog('Hang', `[${targetName}] 本次挂机的证据式重连已用满 3 次，转入定时续跑 (避免长尾循环)。`, 'info');
             this.scheduleHangRetry(onLog);
             break;
           }
-          attempt--;
-          onLog('Hang', `[${targetName}] 挂机通道闪断 (${reasonStr})，45 秒后自动重连续跑 (${transientRetries}/10)...`, 'warning');
-          await new Promise(r => setTimeout(r, 45000));
+          attempt--; // 不占用补挂轮次预算；轮次预算由 hangReconnectCount 与 100 分钟硬上限共同约束
+          onLog('Hang', `[${targetName}] ✅ 证据鉴别通过：官方计时冻结，确认无客户端在用 (断开原因: ${reasonStr})，60 秒后重连续挂 (${this.hangReconnectCount}/3)...`, 'info');
+          await new Promise(r => setTimeout(r, 60000));
           continue;
         }
 
@@ -2428,8 +2706,9 @@ class CtYunClient {
 
     while (this.workerRunning) {
       try {
-        if (this.account.features?.keepAlive === false) {
-          appendLog('KeepAlive', `[${accName}] 保活开关已关闭，守护循环退出。`, 'info');
+        const kaGate = this.resolveTask('keepAlive');
+        if (!kaGate.enabled) {
+          appendLog('KeepAlive', `[${accName}] ${kaGate.reason}，守护循环退出。`, 'info');
           this.stopKeepAliveWorker();
           break;
         }
@@ -2479,7 +2758,7 @@ class CtYunClient {
         // 2. 遍历名下所有云电脑，检查开机/休眠状态并自动唤醒未启动机器 (多机独立守护过滤)
         let hasWokenAny = false;
         for (const d of desktops) {
-          if (d.keepaliveEnabled === false) continue; // 用户关闭了该机独立保活
+          if (!this.resolveTask('keepAlive', d).enabled) continue; // 统一入口：账号级/单机保活开关
           const isAutoBootAllowed = d.autoBootEnabled !== false;
           const isRunning = d && (d.useStatusText === '运行中' || d.useStatus == 25);
           const dId = d.objId || d.desktopId;
@@ -2512,7 +2791,7 @@ class CtYunClient {
         const now = Date.now();
         for (const d of desktops) {
           if (!this.workerRunning || this.isTaskHanging) break;
-          if (d.keepaliveEnabled === false) continue; // 单机独立保活关闭则跳过
+          if (!this.resolveTask('keepAlive', d).enabled) continue; // 统一入口：账号级/(该机)独立保活开关
 
           // 获取该台天翼云电脑的独立脉冲周期 (未单独指定则继承账号/系统全局默认)
           const dIntervalSec = Math.min(3300, Math.max(10, parseInt(d.keepaliveInterval) || defaultPulseGapSec));
@@ -3690,7 +3969,8 @@ function rewardNeedsDesktop(prodId, prodType) {
     const pwd = (body.password || '').trim();
     const name = (body.name || user).trim();
     const accountType = body.accountType || 'main';
-    const autoBoot = body.autoBoot !== false;
+    // 【2026-09-22】移动云账号不再有 autoBoot（自动开机守护）字段：
+    // 底层开机引擎 (boot_engine) 已整体删除，该开关对所有移动云账号均已失效，不再写入配置。
     const keepaliveInterval = parseInt(body.keepaliveInterval) || 600;
     const verificationCode = (body.verificationCode || '').trim();
     const randomCode = (body.randomCode || '').trim();
@@ -3724,8 +4004,8 @@ function rewardNeedsDesktop(prodId, prodType) {
           keepAlive: true,
           cagKeepAlive: true,
           sohoHeartbeat: true,
-          mqttKeepAlive: true,
-          autoBoot
+          mqttKeepAlive: true
+          // autoBoot 已移除（底层开机引擎删除，移动云无开机能力）
         },
         vms,
         stats: {
@@ -3897,10 +4177,18 @@ function rewardNeedsDesktop(prodId, prodType) {
 
     const body = await parseJsonBody(req);
     const vmKey = String(body.vmId || body.desktopId || body.userServiceId || '');
-    const featureName = body.feature; // 'keepaliveEnabled' | 'autoBootEnabled' | 'taskEnabled' | 'keepaliveInterval'
+    const featureName = body.feature; // 'keepaliveEnabled' | 'taskEnabled' | 'keepaliveInterval'（'autoBootEnabled' 仅天翼云历史兼容）
 
     if (!vmKey || !['keepaliveEnabled', 'autoBootEnabled', 'taskEnabled', 'keepaliveInterval'].includes(featureName)) {
       jsonResponse(res, { error: '参数错误：必须提供有效的 vmId 与 feature' }, 400);
+      return;
+    }
+
+    // 【2026-09-22 用户要求】移动云【自动开机守护】开关已随底层开机引擎 (boot_engine) 整体删除：
+    // 对移动云显式拒绝 autoBootEnabled，杜绝该"开机"能力以任何形式复活。
+    // 天翼云 desktop 的 autoBootEnabled 属独立功能，不受影响，继续放行。
+    if (acc.platform === 'ydpc' && featureName === 'autoBootEnabled') {
+      jsonResponse(res, { error: '移动云【自动开机守护】已移除（底层开机引擎已删除）。如需开机，请在移动云官方 App 中连接一次。' }, 400);
       return;
     }
 
@@ -4514,56 +4802,80 @@ function rewardNeedsDesktop(prodId, prodType) {
     }
 
     const client = getClient(acc);
-    const now = getBeijingTimeString();
 
     try {
       if (taskType === 'sign') {
         executeNativeSign(client, acc, (src, msg, lvl) => appendLog(src, `[${acc.name}] ${msg}`, lvl))
           .then(async (signRes) => {
-            await client.refreshOfficialTasks();
-            // 严格以官方任务中心实时判定为准：只有真正确认达成才更新完成时间与推送成功通知，绝不虚报
+            // 只有官方任务中心确认达成，才更新完成时间并推送成功通知，绝不虚报
             if (signRes && signRes.isCompleted) {
-              acc.stats.lastSignTime = now;
+              await client.refreshOfficialTasks();
               saveConfig(appConfig);
               sendAccountNotification(
                 acc,
                 `✅ 登录打卡达成 - ${acc.name}`,
                 `账号【${acc.name}】今日登录AI云电脑任务已完成，100 积分已到账！`
               );
+            } else if (signRes && signRes.pendingVerify) {
+              appendLog('Sign', `[${acc.name}] 打卡认领已下发，官方尚未确认。已安排跨分钟复检 (期间不会重复认领，不会打扰客户端)。`, 'info');
             }
           })
           .catch(err => appendLog('Sign', `[${acc.name}] 打卡执行异常: ${err.message}`, 'error'));
 
-        jsonResponse(res, { message: `[${acc.name}] 打卡指令已下发，官方积分实时同步刷新` });
+        // 中性返回：认领下发 ≠ 任务达成。原先此处直接回"指令已下发"并被前端渲染为成功，
+        // 是历史上"页面显示成功、实际没有积分"的直接来源。
+        jsonResponse(res, { message: `[${acc.name}] 打卡流程已启动：认领后需等待官方任务中心确认，系统会自动复检。请稍后刷新查看结果。` });
         return;
 
       } else if (taskType === 'aiChat') {
         executeNativeAiChat(client, acc, (src, msg, lvl) => appendLog(src, `[${acc.name}] ${msg}`, lvl))
           .then(async () => {
-            acc.stats.lastAiChatTime = now;
-            saveConfig(appConfig);
-            await client.refreshOfficialTasks();
-            sendAccountNotification(
-              acc,
-              `🤖 AI对话任务达成 - ${acc.name}`,
-              `账号【${acc.name}】今日AI智能对话任务已完成，100 积分已入账！`
-            );
+            const r = await client.refreshOfficialTasks();
+            const t = (client.metrics.officialTasks || []).find(x => x.name.includes('AI对话'));
+            const done = !!(t && (t.status === 2 || (t.total > 0 && t.current >= t.total)));
+            if (done) {
+              saveConfig(appConfig);
+              sendAccountNotification(
+                acc,
+                `🤖 AI对话任务达成 - ${acc.name}`,
+                `账号【${acc.name}】今日AI智能对话任务已完成，100 积分已入账！`
+              );
+            } else if (r && r.ok === false) {
+              appendLog('AIChat', `[${acc.name}] ⚠️ AI 对话请求已发出，但官方任务中心不可读 (${r.reason})，无法核对是否计入。请稍后手动刷新确认。`, 'warning');
+            } else {
+              appendLog('AIChat', `[${acc.name}] ⚠️ AI 对话请求已发出，但官方任务中心暂未显示达成 (落账可能有延迟)。本次不判定为完成。`, 'warning');
+            }
           })
           .catch(err => appendLog('AIChat', `[${acc.name}] AI 对话任务异常: ${err.message}`, 'error'));
 
-        jsonResponse(res, { message: `[${acc.name}] AI 智能对话已触发执行，已获取对应积分` });
+        jsonResponse(res, { message: `[${acc.name}] AI 对话已启动，结果以官方任务中心为准，请稍后刷新查看。` });
         return;
 
       } else if (taskType === 'hang') {
         executeNativeHang(client, acc, (src, msg, lvl) => appendLog(src, `[${acc.name}] ${msg}`, lvl))
           .then(async () => {
-            acc.stats.lastHangTime = now;
-            saveConfig(appConfig);
-            await client.refreshOfficialTasks();
+            const r = await client.refreshOfficialTasks();
+            const t = (client.metrics.officialTasks || []).find(x => x.name.includes('使用1小时'));
+            const done = !!(t && (t.status === 2 || (t.total > 0 && t.current >= t.total)));
+            const curMin = t ? Math.floor((t.current || 0) / 60) : 0;
+            if (done) {
+              saveConfig(appConfig);
+              appendLog('Hang', `[${acc.name}] ✅ 官方任务中心已确认今日挂机 1 小时达成。`, 'success');
+              sendAccountNotification(
+                acc,
+                `🎉 挂机1小时任务达成 - ${acc.name}`,
+                `账号【${acc.name}】今日使用 AI 云电脑达到 1 小时任务已完成，100 积分已入账！`
+              );
+            } else if (r && r.ok === false) {
+              appendLog('Hang', `[${acc.name}] ⚠️ 官方任务中心不可读 (${r.reason})，无法核对挂机进度。本次不判定。`, 'warning');
+            } else {
+              // 原先此处无条件写入 lastHangTime，导致数据模型虚报"今日已执行挂机"
+              appendLog('Hang', `[${acc.name}] 本次挂机阶段结束，官方进度 ${curMin}/60 分钟，尚未达成。已按其自愈机制安排续跑。`, 'info');
+            }
           })
           .catch(err => appendLog('Hang', `[${acc.name}] 挂机守护异常: ${err.message}`, 'error'));
 
-        jsonResponse(res, { message: `[${acc.name}] 云电脑长连接守护已就绪，正在持续累加挂机时长` });
+        jsonResponse(res, { message: `[${acc.name}] 挂机守护已启动，进度以官方任务中心为准，请稍后刷新查看。` });
         return;
 
       } else if (taskType === 'redeem') {
@@ -5286,7 +5598,7 @@ function rewardNeedsDesktop(prodId, prodType) {
             deviceCode: a.deviceCode || '',
             keepaliveInterval: parseInt(a.keepaliveInterval) || 600,
             enabled: a.enabled !== false,
-            features: a.features || { autoBoot: true, cagKeepAlive: true, sohoHeartbeat: true, keepAlive: true },
+            features: a.features || { cagKeepAlive: true, sohoHeartbeat: true, keepAlive: true },
             vms: a.vms || []
           };
         } else {
@@ -5429,8 +5741,7 @@ function rewardNeedsDesktop(prodId, prodType) {
         features: item.features || (isYdpc ? {
           keepAlive: true,
           cagKeepAlive: true,
-          sohoHeartbeat: true,
-          autoBoot: true
+          sohoHeartbeat: true
         } : {
           keepAlive: true,
           autoSign: true,

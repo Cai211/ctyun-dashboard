@@ -1,4 +1,5 @@
 const crypto = require('crypto');
+const dns = require('dns');
 
 const PRESET_MESSAGES = [
   '今天北京天气怎么样？（请用一句话回答）',
@@ -20,13 +21,118 @@ function sha256(t) {
 }
 
 /**
+ * 诊断埋点 (零行为改动)：完整还原网络异常的真实成因链。
+ * Node/undici 在网络层失败时只会抛 "TypeError: fetch failed"，
+ * 真正的原因 (ENOTFOUND / ECONNRESET / ETIMEDOUT / TLS 校验失败等) 藏在 err.cause 里。
+ * 本函数把整条 cause 链 + Happy-Eyeballs 聚合错误全部展开，避免所有故障塌缩成同一句无信息文本。
+ */
+function describeNetError(err) {
+  if (!err) return 'unknown';
+  const seen = new Set();
+  const chain = [];
+  let cur = err;
+  for (let depth = 0; depth < 5 && cur; depth++) {
+    if (seen.has(cur)) break;
+    seen.add(cur);
+    const bits = [];
+    if (cur.name && cur.name !== 'Error') bits.push(cur.name);
+    if (cur.code) bits.push(`code=${cur.code}`);
+    if (cur.errno) bits.push(`errno=${cur.errno}`);
+    if (cur.syscall) bits.push(`syscall=${cur.syscall}`);
+    if (cur.hostname) bits.push(`host=${cur.hostname}`);
+    if (cur.address) bits.push(`addr=${cur.address}${cur.port ? ':' + cur.port : ''}`);
+    if (cur.message && cur.message !== err.message) bits.push(`msg=${String(cur.message).slice(0, 200)}`);
+    chain.push(`[${depth}] ${bits.join(' ') || String(cur.message || 'unknown').slice(0, 200)}`);
+    cur = cur.cause;
+  }
+  // Node 20+ 默认开启 autoSelectFamily (Happy Eyeballs)，IPv4/IPv6 双失败时会给出聚合错误
+  const agg = err.aggregateErrors || err.errors;
+  if (Array.isArray(agg) && agg.length) {
+    agg.slice(0, 4).forEach((sub, i) => {
+      const bits = [];
+      if (sub && sub.code) bits.push(`code=${sub.code}`);
+      if (sub && sub.address) bits.push(`addr=${sub.address}${sub.port ? ':' + sub.port : ''}`);
+      chain.push(`[agg${i}] ${bits.join(' ') || String((sub && sub.message) || 'unknown').slice(0, 160)}`);
+    });
+  }
+  return chain.join(' → ');
+}
+
+/**
+ * 诊断埋点 (零行为改动)：DNS 预解析。
+ * 直接把域名解析成 IP 并打印族 (IPv4/IPv6)，用于一眼区分
+ * "DNS 解析失败" / "解析到 IPv6 但无路由" / "解析正常但 TLS/连接被拒"。
+ */
+async function diagDns(label, hostname, onLog = console.log, src = 'AIChat') {
+  const started = Date.now();
+  try {
+    const addrs = await dns.promises.lookup(hostname, { all: true });
+    const list = (addrs || []).map(a => `${a.address}(IPv${a.family})`).join(', ') || '空';
+    onLog(src, `[网络诊断] ${label} DNS ${hostname} → ${list} (${Date.now() - started}ms)`, 'info');
+    return addrs;
+  } catch (err) {
+    onLog(src, `[网络诊断] ${label} DNS 解析失败 ${hostname} ✗ ${err.message} | ${describeNetError(err)} (${Date.now() - started}ms)`, 'error');
+    return null;
+  }
+}
+
+/**
+ * 诊断与超时双重包装的 fetch。
+ * - 成功：记录 HTTP 状态码与耗时；
+ * - 失败：展开完整 cause 链并抛出原错误；
+ * - 超过 timeoutMs 未完成：主动中断并抛出可识别的超时错误。
+ *
+ * 【为什么必须主动中断】(新发现 #35)：scheduler 是串行 await 每个账号的每个任务，
+ * 原先的裸 fetch 无任何超时，单个账号的网络挂起会让整个账号队列永久卡死，
+ * 后续账号的任务全部不再执行，且日志中看不到任何异常。
+ */
+async function netFetch(label, url, options = {}, onLog = console.log, src = 'AIChat', timeoutMs = 45000) {
+  const started = Date.now();
+  const stallTimer = setInterval(() => {
+    onLog(src, `[网络诊断] ${label} 已等待 ${Math.round((Date.now() - started) / 1000)}s 仍无响应 (超时上限 ${Math.round(timeoutMs / 1000)}s) | ${url}`, 'warning');
+  }, 15000);
+
+  let signal = options.signal;
+  let abortReason = '';
+  if (!signal && timeoutMs > 0 && typeof AbortSignal !== 'undefined' && typeof AbortSignal.timeout === 'function') {
+    try {
+      signal = AbortSignal.timeout(timeoutMs);
+      abortReason = `请求超过 ${Math.round(timeoutMs / 1000)} 秒未完成，已主动中断以免阻塞账号队列`;
+    } catch (e) { signal = undefined; }
+  }
+
+  try {
+    const res = await fetch(url, signal ? { ...options, signal } : options);
+    clearInterval(stallTimer);
+    onLog(src, `[网络诊断] ${label} ← HTTP ${res.status} (${Date.now() - started}ms)`, 'info');
+    return res;
+  } catch (err) {
+    clearInterval(stallTimer);
+    const isTimeout = err && (err.name === 'TimeoutError' || err.name === 'AbortError');
+    const detail = describeNetError(err);
+    if (isTimeout) {
+      const e = new Error(`${label} ${abortReason || '请求超时'} | ${detail} | 耗时 ${Date.now() - started}ms`);
+      e.__netDetail = detail;
+      e.__timeout = true;
+      onLog(src, `[网络诊断] ${label} ✗ 超时中断 | ${e.message}`, 'error');
+      throw e;
+    }
+    onLog(src, `[网络诊断] ${label} ✗ ${err.message} | ${detail} | 耗时 ${Date.now() - started}ms | url=${url}`, 'error');
+    try { err.__netDetail = detail; } catch (e) { /* 只读属性等场景忽略 */ }
+    throw err;
+  }
+}
+
+/**
  * 纯原生毫秒级 HTTP 协议直连执行天翼 AI 对话任务 (彻底剔除 Chromium/Puppeteer)
  */
 async function executeNativeAiChat(client, acc, onLog = console.log) {
+  const flowStartedAt = Date.now();
   onLog('AIChat', `正在获取 AI 对话安全网关与 SSO 公钥配置...`, 'info');
   
   // 1. 获取网关信息并解密 SSO 公钥
-  const sysRes = await fetch('https://gwyilian.ctyun.cn/server/eaiSysInfo');
+  await diagDns('网关配置', 'gwyilian.ctyun.cn', onLog);
+  const sysRes = await netFetch('[1/4] 获取网关配置 eaiSysInfo', 'https://gwyilian.ctyun.cn/server/eaiSysInfo', {}, onLog);
   const sysJson = await sysRes.json();
   const rawSys = (sysJson.data || '').replace(/[\r\n]/g, '');
   const decipher = crypto.createDecipheriv('aes-128-ecb', Buffer.from('chinatelecom@cnn', 'utf8'), null);
@@ -90,9 +196,8 @@ async function executeNativeAiChat(client, acc, onLog = console.log) {
       }
     }
 
-    const resp = await fetch(`https://desk.ctyun.cn:8810/api/auth/client/getTicket?service=${encodeURIComponent(service)}`, {
-      headers
-    });
+    const ticketUrl = `https://desk.ctyun.cn:8810/api/auth/client/getTicket?service=${encodeURIComponent(service)}`;
+    const resp = await netFetch('[2/4] 获取 CAS Ticket getTicket', ticketUrl, { headers }, onLog);
     return await resp.json();
   }
 
@@ -126,7 +231,8 @@ async function executeNativeAiChat(client, acc, onLog = console.log) {
   authParams.append('clientKey', encClientKey);
   authParams.append('clientKeyId', ssopkid);
 
-  const authPostRes = await fetch('https://eaichat.ctyun.cn/sso/login/v2/iam/ticketAuthorize', {
+  await diagDns('AI 对话站', 'eaichat.ctyun.cn', onLog);
+  const authPostRes = await netFetch('[3/4] SSO Ticket 换取 sessionKey', 'https://eaichat.ctyun.cn/sso/login/v2/iam/ticketAuthorize', {
     method: 'POST',
     headers: {
       'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/137.0.0.0',
@@ -134,7 +240,7 @@ async function executeNativeAiChat(client, acc, onLog = console.log) {
       'Content-Type': 'application/x-www-form-urlencoded'
     },
     body: authParams.toString()
-  });
+  }, onLog);
 
   const authJson = await authPostRes.json();
   if (authJson.resultCode !== 0 || !authJson.data?.sessionKey) {
@@ -180,7 +286,7 @@ async function executeNativeAiChat(client, acc, onLog = console.log) {
   const webSign = sha256(rawSign);
   const traceId = crypto.randomUUID();
 
-  const chatRes = await fetch('https://eaichat.ctyun.cn/ai/portal/v3/openai/chat/completions', {
+  const chatRes = await netFetch('[4/4] 发送 AI 对话请求', 'https://eaichat.ctyun.cn/ai/portal/v3/openai/chat/completions', {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
@@ -199,7 +305,7 @@ async function executeNativeAiChat(client, acc, onLog = console.log) {
       'Web-Timestamp': ts
     },
     body: bodyJsonStr
-  });
+  }, onLog);
 
   if (!chatRes.ok) {
     throw new Error(`AI 对话接口异常 (HTTP ${chatRes.status})`);
@@ -214,7 +320,7 @@ async function executeNativeAiChat(client, acc, onLog = console.log) {
   } catch (e) {
     if (e.message && e.message.startsWith('AI 对话业务返回错误')) throw e;
   }
-  onLog('AIChat', `✅ AI 对话成功完成！已获取今日 100 积分！`, 'success');
+  onLog('AIChat', `✅ AI 对话成功完成！已获取今日 100 积分！(全流程耗时 ${Math.round((Date.now() - flowStartedAt) / 1000)}s)`, 'success');
   
   await client.refreshOfficialTasks();
   return { success: true, message: 'AI 对话成功完成，积分已刷新' };
@@ -227,12 +333,32 @@ async function executeNativeSign(client, acc, onLog = console.log) {
   const accName = acc.name || acc.user;
   onLog('Sign', `正在执行天翼云官方【登录AI云电脑】打卡认证...`, 'info');
   try {
+    // 0. 账号级开关：统一入口判定 (暗线 A)
+    if (typeof client.resolveTask === 'function') {
+      const accGate = client.resolveTask('sign');
+      if (!accGate.enabled) {
+        onLog('Sign', `[${accName}] ${accGate.reason}，本次登录打卡自动跳过。`, 'info');
+        return { success: true, isCompleted: false, message: accGate.reason };
+      }
+    }
+
     // 1. 检查今日是否已在官方任务中心完成
-    await client.refreshOfficialTasks();
-    const loginTask = client.metrics.officialTasks?.find(t => t.name.includes('登录AI云电脑') || t.name.includes('登录'));
-    if (loginTask && (loginTask.status === 2 || (loginTask.total > 0 && loginTask.current >= loginTask.total))) {
+    const preRefresh = await client.refreshOfficialTasks();
+    const loginTaskDone = () => {
+      const t = (client.metrics.officialTasks || []).find(x => x.name.includes('登录AI云电脑') || x.name.includes('登录'));
+      return !!(t && (t.status === 2 || (t.total > 0 && t.current >= t.total)));
+    };
+    const alreadyDone = typeof client.isSignTaskDone === 'function' ? client.isSignTaskDone() : loginTaskDone();
+    if (alreadyDone) {
       onLog('Sign', `✅ 今日登录打卡任务已在官方达成 (+100积分)，无需重复执行。`, 'success');
+      if (typeof client.clearSignVerify === 'function') client.clearSignVerify();
       return { success: true, isCompleted: true, message: '今日已完成登录打卡' };
+    }
+    // 官方状态不可读时不得贸然认领：认领会顶掉在用客户端，而"不知道是否已完成"不构成执行理由
+    if (preRefresh && preRefresh.ok === false) {
+      onLog('Sign', `[${accName}] 官方任务中心暂不可读 (${preRefresh.reason})，无法确认今日打卡状态。为避免盲目认领抢占，本次暂不认领，已安排复检。`, 'warning');
+      if (typeof client.scheduleSignVerify === 'function') client.scheduleSignVerify(onLog);
+      return { success: true, isCompleted: false, pendingVerify: true, message: '官方状态不可读，本次暂不认领' };
     }
 
     // 2. 状态避让与互斥检查：如果当前正在执行 1 小时挂机任务，挂机会话本身即发送 112/104 桌面认领，直接复用
@@ -241,15 +367,29 @@ async function executeNativeSign(client, acc, onLog = console.log) {
       return { success: true, isCompleted: false, message: '挂机会话正在执行认领' };
     }
 
-    // 3. 用户浏览器操作或客户端避让期：主动避让
+    // 3. 用户浏览器操作或客户端避让期：主动避让，但改为"复检官方"而非直接放弃。
+    //    依据 issue #17 的实测：真实客户端登录本身就会让官方计入【登录AI云电脑】，
+    //    因此有人在用时我们不需要、也不应该去认领抢占，只需等待官方确认。
     if (client.isWebUserActive && Date.now() < client.webUserActiveUntil) {
-      onLog('Sign', `[${accName}] 浏览器用户正在操作云电脑，打卡任务主动避让。`, 'info');
-      return { success: true, isCompleted: false, message: '浏览器用户操作中，主动避让' };
+      onLog('Sign', `[${accName}] 浏览器用户正在操作云电脑，本次不认领抢占；改为复检官方任务中心，真实登录通常会自行计入打卡。`, 'info');
+      if (typeof client.scheduleSignVerify === 'function') client.scheduleSignVerify(onLog);
+      return { success: true, isCompleted: false, message: '浏览器用户操作中，改为等待官方确认' };
     }
     if (Date.now() < client.externalYieldUntil) {
       const waitMin = Math.ceil((client.externalYieldUntil - Date.now()) / 60000);
-      onLog('Sign', `[${accName}] 官方客户端近期活跃处于避让期 (剩余 ${waitMin} 分钟)，打卡任务主动避让。`, 'info');
-      return { success: true, isCompleted: false, message: '处于客户端避让冷却期' };
+      onLog('Sign', `[${accName}] 官方客户端近期活跃处于避让期 (剩余 ${waitMin} 分钟)，本次不认领抢占；改为复检官方任务中心。`, 'info');
+      if (typeof client.scheduleSignVerify === 'function') client.scheduleSignVerify(onLog);
+      return { success: true, isCompleted: false, message: '处于客户端避让冷却期，改为等待官方确认' };
+    }
+
+    // 3.1 今日已下发过认领且仍在待确认期：绝不重复认领。
+    //     重复认领会反复向网关下发 Type 112/104，既会把在用客户端顶下线，
+    //     也会让官方计时/打卡记录出现抖动。此处只继续复检，不再动通道。
+    if (client.signVerifyPendingSince) {
+      const waitedMin = Math.floor((Date.now() - client.signVerifyPendingSince) / 60000);
+      onLog('Sign', `[${accName}] 今日登录认领已下发，仍在等待官方确认 (已等待约 ${waitedMin} 分钟)。本次不再重复认领，继续复检官方任务中心。`, 'info');
+      if (typeof client.scheduleSignVerify === 'function') client.scheduleSignVerify(onLog);
+      return { success: true, isCompleted: false, pendingVerify: true, message: '认领已下发，等待官方确认（复检中）' };
     }
 
     // 4. 获取目标云电脑（优选已开机运行的主机）
@@ -258,9 +398,11 @@ async function executeNativeSign(client, acc, onLog = console.log) {
       onLog('Sign', `[${accName}] 账号名下暂无可用的云电脑主机。`, 'warning');
       return { success: true, isCompleted: false, message: '名下无可用云电脑' };
     }
-    const taskOnDesktops = desktops.filter(d => d.taskEnabled !== false);
+    const taskOnDesktops = typeof client.resolveTask === 'function'
+      ? desktops.filter(d => client.resolveTask('sign', d).enabled)
+      : desktops.filter(d => d.taskEnabled !== false);
     if (taskOnDesktops.length === 0) {
-      onLog('Sign', `[${accName}] 账号名下所有云电脑的【任务】开关均已关闭，跳过桌面登录认领。`, 'info');
+      onLog('Sign', `[${accName}] 账号名下所有云电脑的【🎯 任务】开关均已关闭，跳过桌面登录认领。`, 'info');
       return { success: true, isCompleted: false, message: '任务开关已关闭' };
     }
 
@@ -293,6 +435,15 @@ async function executeNativeSign(client, acc, onLog = console.log) {
     // 只有官方任务中心确认达成才会记录成功，绝不虚报。
     onLog('Sign', `[${accName}][${targetName}] 正在建立视讯网关桌面登录认领会话 (Type 118/112/104)，保持观察等待官方确认...`, 'info');
 
+    // 诊断埋点 (零行为改动)：记录认领前后的官方任务中心状态与观察窗时长，
+    // 用于判定"官方异步落账延迟"是否超过观察窗 (这是"日志未报错但当场不见积分"的关键证据)
+    const snapSignTask = () => {
+      const t = client.metrics.officialTasks?.find(x => x.name.includes('登录AI云电脑') || x.name.includes('登录'));
+      return t ? `status=${t.status} ${t.current || 0}/${t.total || 0}` : '未取到任务项';
+    };
+    const signClaimStartedAt = Date.now();
+    onLog('Sign', `[${accName}][${targetName}] [诊断] 认领前官方任务中心: ${snapSignTask()}`, 'info');
+
     // 独立会话占用标记：仅用于让常态脉冲循环避让，绝不触碰挂机任务的 isTaskHanging 状态位，杜绝互斥串扰
     client._signSessionActive = true;
     let claimResult = null;
@@ -305,23 +456,42 @@ async function executeNativeSign(client, acc, onLog = console.log) {
       client._signSessionActive = false;
     }
 
-    // 7. 会话结束后再次重新拉取官方任务中心，以官方实时状态为唯一判定依据
-    await client.refreshOfficialTasks();
+    onLog('Sign', `[${accName}][${targetName}] [诊断] 认领会话结束 (观察窗设定 300s / 实际 ${Math.round((Date.now() - signClaimStartedAt) / 1000)}s)，结束原因: ${(claimResult && claimResult.reason) || '(窗口到期)'}，会话内目标确认: ${claimResult && claimResult.goalAchieved ? '是' : '否'}`, 'info');
 
-    const verifiedTask = client.metrics.officialTasks?.find(t => t.name.includes('登录AI云电脑') || t.name.includes('登录'));
-    const isDone = verifiedTask ? (verifiedTask.status === 2 || (verifiedTask.total > 0 && verifiedTask.current >= verifiedTask.total)) : false;
-    const goalConfirmed = !!(claimResult && claimResult.goalAchieved) || isDone;
+    // 7. 判定：只以官方任务中心为准，并且只有"确实读到了官方数据"时才允许下结论。
+    //    修复要点 (暗线 C)：观察窗 (300 秒) 只决定何时释放通道，绝不作为成败依据。
+    //    官方落账实测约 14 分钟，远超 300 秒，因此未确认时转入"待确认 + 跨分钟复检"，
+    //    而不是当场宣判 —— 这是"日志说成功、积分实际未到"的根因所在。
+    const postRefresh = await client.refreshOfficialTasks();
+
+    const isDone = typeof client.isSignTaskDone === 'function' ? client.isSignTaskDone() : loginTaskDone();
+    const inSessionConfirmed = !!(claimResult && claimResult.goalAchieved);
     const claimReason = (claimResult && claimResult.reason) || '';
+    const refreshReadable = !(postRefresh && postRefresh.ok === false);
 
-    if (goalConfirmed) {
+    onLog('Sign', `[${accName}][${targetName}] [诊断] 认领后官方任务中心: ${snapSignTask()} → 会话内确认=${inSessionConfirmed} / 官方状态确认=${isDone} / 官方数据可读=${refreshReadable}`, 'info');
+
+    if (inSessionConfirmed || isDone) {
       onLog('Sign', `🎉 官方任务中心已确认【登录AI云电脑】达成 (+100积分)！`, 'success');
-    } else if (claimReason === 'Preempted by Client' || claimReason === 'Yield to External Client' || claimReason === 'Yield to Web User') {
-      onLog('Sign', `[${accName}][${targetName}] 检测到官方客户端接入/用户操作，登录认领会话已主动让位，本次未确认达成。`, 'warning');
-    } else {
-      onLog('Sign', `[${accName}][${targetName}] 本轮认领观察窗口结束，官方任务中心暂未确认【登录AI云电脑】达成；桌面会话认领已完成，若稍后运行 1 小时挂机或官方客户端接入将自动计入积分。`, 'info');
+      if (typeof client.clearSignVerify === 'function') client.clearSignVerify();
+      return { success: true, isCompleted: true, message: '官方已确认登录打卡完成' };
     }
 
-    return { success: true, isCompleted: goalConfirmed, message: goalConfirmed ? '官方已确认登录打卡完成' : '已建立登录认领会话，等待官方确认积分计入' };
+    // ── 以下为"未确认"分支：一律不得报成功 ──────────────────────────────
+    if (!refreshReadable) {
+      onLog('Sign', `[${accName}][${targetName}] ⚠️ 认领已完成，但官方任务中心本次不可读 (${(postRefresh && postRefresh.reason) || '原因未知'})，无法判定成败。已安排复检，稍后以官方状态为准。`, 'warning');
+    } else if (claimReason === 'Preempted by Client' || claimReason === 'Yield to External Client' || claimReason === 'Yield to Web User') {
+      onLog('Sign', `[${accName}][${targetName}] 认领会话因官方客户端接入/用户操作而主动让位 (${claimReason})，本次未确认达成。已安排复检官方任务中心。`, 'warning');
+    } else {
+      onLog('Sign', `[${accName}][${targetName}] 认领会话已完成并释放通道 (结束原因: ${claimReason || '窗口到期'})，但官方任务中心暂未确认【登录AI云电脑】。官方落账存在分钟级延迟 (用户实测约 14 分钟)，300 秒观察窗不足以判定成败 —— 本次结论为【未确认】，已安排跨分钟复检。`, 'info');
+    }
+
+    if (typeof client.scheduleSignVerify === 'function') {
+      client.scheduleSignVerify(onLog);
+    } else {
+      onLog('Sign', `[${accName}] ⚠️ 缺少复检调度能力，本次打卡结论为【未确认】，请稍后手动刷新官方任务中心核对。`, 'warning');
+    }
+    return { success: true, isCompleted: false, pendingVerify: true, message: '认领已下发，等待官方确认（已安排复检，期间不会重复认领）' };
   } catch (e) {
     onLog('Sign', `登录打卡异常: ${e.message}`, 'error');
     throw e;

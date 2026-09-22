@@ -1,7 +1,10 @@
 const { SohoClient } = require('./soho_client');
 const { performCagAuthHold } = require('./cag_client');
-const { bootYdpcVmUnified } = require('./boot_engine');
 const { MqttKeepAliveClient } = require('./mqtt_client');
+
+// 【2026-09-22】底层开机引擎 (boot_engine / SC 直连开机) 已按用户要求整体删除。
+// 本项目移动云侧现在只保留：账号登录、SOHO 心跳、ZTEC CAG 握手、官方 MQTT 长连接、状态监控，
+// 以及官方 SOHO 的【关机 / 重启】。不再具备任何"开机 / 唤醒"能力。
 
 function getBeijingTimeString() {
   const d = new Date();
@@ -101,20 +104,18 @@ class YdpcClient {
         }
       }
 
-      // 差量合并引擎 (Diff-Merge)：严格保留本地已有的单机独立保活、独立周期与开机偏好设置
+      // 差量合并引擎 (Diff-Merge)：严格保留本地已有的单机独立保活与独立周期设置
+      // (原 autoBootEnabled / _bootRestricted 开机相关字段已随底层开机引擎一并移除)
       const oldVmsMap = new Map((this.account.vms || []).map(v => [String(v.userServiceId), v]));
       for (const vm of vms) {
         const old = oldVmsMap.get(String(vm.userServiceId));
         if (old) {
           if (old.keepaliveEnabled !== undefined) vm.keepaliveEnabled = old.keepaliveEnabled;
-          if (old.autoBootEnabled !== undefined) vm.autoBootEnabled = old.autoBootEnabled;
           if (old.keepaliveInterval !== undefined) vm.keepaliveInterval = old.keepaliveInterval;
           if (old.lastKeepAliveAt !== undefined) vm.lastKeepAliveAt = old.lastKeepAliveAt;
           if (old._durationExhausted !== undefined) vm._durationExhausted = old._durationExhausted;
-          if (old._bootRestricted !== undefined) vm._bootRestricted = old._bootRestricted;
         } else {
           if (vm.keepaliveEnabled === undefined) vm.keepaliveEnabled = true;
-          if (vm.autoBootEnabled === undefined) vm.autoBootEnabled = true;
         }
       }
 
@@ -346,10 +347,6 @@ class YdpcClient {
     }
   }
 
-  async bootVm(userServiceId) {
-    return await this.controlPower(userServiceId, 'poweron');
-  }
-
   async controlPower(userServiceId, action = 'poweron') {
     const accName = this.account.name || this.account.user;
     const usid = userServiceId || this.account.vms?.[0]?.userServiceId;
@@ -372,20 +369,14 @@ class YdpcClient {
       this.appendLog('SOHO', `[${accName}] ✅ 云电脑关机/断开指令已生效！`, 'success', accName, 'ydpc');
       setTimeout(() => this.refreshVms().catch(() => {}), 2000);
       return res;
-    } else {
-      // poweron / awake / start: 走 SC/ZTE 自适应融合开机
-      this.appendLog('SOHO', `[${accName}] 正在执行移动云【开机/唤醒】指令 (userServiceId: ${usid})...`, 'info', accName, 'ydpc');
-      let firmAuth = null;
-      try {
-        firmAuth = await this.sohoClient.getFirmAuth(usid);
-      } catch (e) {}
-
-      const currentVm = (this.account.vms || []).find(v => String(v.userServiceId) === String(usid)) || {};
-      const res = await bootYdpcVmUnified(this.sohoClient, firmAuth, usid, currentVm);
-      this.appendLog('SOHO', `[${accName}] ✅ ${res.message || '云电脑开机/激活指令已成功下达！'}`, 'success', accName, 'ydpc');
-      setTimeout(() => this.refreshVms().catch(() => {}), 3000);
-      return res;
     }
+
+    // 【2026-09-22 用户要求·底层开机能力已移除】
+    // 原 poweron / awake / start 分支走 boot_engine 的 "SC/ZTE 自适应融合开机"：
+    // 它会伪造官方 SC 客户端身份（cdpsdk-server-1.0）、使用第三方开源项目硬编码的
+    // 客户端 ID 与 RSA 公钥直连 api.soho.komect.com，并在 TLS 层关闭证书校验。
+    // 该引擎连同 boot_engine.js 已整体删除，故此处显式拒绝，不留"静默无响应"的隐式行为。
+    throw new Error('本系统已移除移动云【开机 / 唤醒】能力（底层直连开机引擎已删除）。如需开机，请在移动云官方 App 中连接一次。');
   }
 
   startKeepAliveWorker() {
@@ -443,7 +434,6 @@ class YdpcClient {
           }
 
           const isVmOff = String(vm.vmStatus || '').includes('关机') || vm.vmStatusCode === 23 || vm.vmStatusCode === 16;
-          const isSubAccount = this.account.accountType === 'sub';
 
           const isPermanent = vm.durationMode === 'permanent' || String(vm.remainText || '').includes('永久');
           const isLimitedExpired = !isPermanent && (
@@ -462,27 +452,12 @@ class YdpcClient {
           );
 
           // 1. 自动开机守护逻辑
-          const isAutoBootAllowed = this.account.features?.autoBoot !== false && vm.autoBootEnabled !== false;
-          if (isAutoBootAllowed && isVmOff) {
-            if (isLimitedExpired) {
-              if (!vm._hasWarnedExpired) {
-                this.appendLog('SOHO', `[${accName}][${vm.vmName}] 检测到机器已关机，由于限时套餐时长已耗尽 (${vm.remainText || '0小时'})，已智能跳过自动开机守护`, 'info', accName, 'ydpc');
-                vm._hasWarnedExpired = true;
-              }
-            } else if (isSubAccount || vm._bootRestricted) {
-              if (!vm._hasWarnedSub) {
-                this.appendLog('SOHO', `[${accName}][${vm.vmName}] 检测到机器已关机，受平台架构权限限制无法直接拉起，已进入被动守护待命模式`, 'info', accName, 'ydpc');
-                vm._hasWarnedSub = true;
-              }
-            } else {
-              this.appendLog('SOHO', `[${accName}][${vm.vmName}] 检测到机器已关机，触发【自动开机守护】拉起中...`, 'warning', accName, 'ydpc');
-              await this.bootVm(vm.userServiceId).catch(err => {
-                this.appendLog('SOHO', `[${accName}][${vm.vmName}] 自动开机未成功: ${err.message}`, 'warning', accName, 'ydpc');
-                if (err.message?.includes('子账号受限') || err.message?.includes('无权访问') || err.message?.includes('4141') || err.message?.includes('选择云电脑类型') || err.message?.includes('7025') || err.message?.includes('中兴ZTE云电脑已完成激活')) {
-                  vm._bootRestricted = true;
-                }
-              });
-            }
+          // 【2026-09-22 用户要求·已移除】检测到关机后自动下发开机指令的能力已随底层开机引擎一并删除。
+          // 移动云侧不再主动拉起任何机器，避免在官方面前伪造客户端身份，也避免误耗限时套餐时长。
+          // 机器关机后的恢复方式：在移动云官方 App 中连接一次。
+          if (isVmOff && !vm._hasNotifiedOff) {
+            vm._hasNotifiedOff = true;
+            this.appendLog('SOHO', `[${accName}][${vm.vmName}] 检测到机器已关机，本系统不再自动开机（底层开机能力已移除）。如需开机请在移动云官方 App 连接一次。`, 'info', accName, 'ydpc');
           }
 
           // 2. 发送 SOHO 心跳与埋点

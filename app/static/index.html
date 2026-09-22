@@ -268,15 +268,8 @@
               <option value="3600">1 小时</option>
             </select>
           </div>
-          <div class="form-group" style="margin-top: 4px;">
-            <div style="display: flex; align-items: center; gap: 10px;">
-              <label class="switch">
-                <input type="checkbox" id="ydpc-autoboot" checked>
-                <span class="slider"></span>
-              </label>
-              <span style="font-size: 13px; font-weight: 600;">启用自动开机守护 (检测到机器关机自动下发唤醒)</span>
-            </div>
-          </div>
+          <!-- 【2026-09-22 用户要求】原「启用自动开机守护」开关已移除：
+               移动云底层开机引擎 (SC/ZTE 直连开机) 已整体删除，不再具备任何开机能力。 -->
         </div>
       </div>
       <div class="modal-footer">
@@ -459,7 +452,7 @@
         </div>
 
         <div style="display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 10px; margin-top: 6px;">
-          <button class="btn btn-success" onclick="executePowerAction('poweron')">🟢 开机 / 唤醒</button>
+          <button class="btn btn-success" id="power-btn-boot" onclick="executePowerAction('poweron')">🟢 开机 / 唤醒</button>
           <button class="btn btn-warning" onclick="executePowerAction('reboot')">🔄 重启云电脑</button>
           <button class="btn btn-danger" onclick="executePowerAction('shutdown')">🔴 关机</button>
         </div>
@@ -848,7 +841,7 @@
       <div>云电脑可视化全功能多账号管理平台 · 纯协议超轻量架构</div>
       <div style="margin-top: 6px;" id="footer-version-container">
         <span id="footer-version-badge" style="color: var(--text-muted); cursor: default;">
-          📌 当前版本: v2.2.3
+          📌 当前版本: v2.2.4
         </span>
       </div>
     </footer>
@@ -858,15 +851,29 @@
   <div class="modal-backdrop hidden" id="release-notes-modal">
     <div class="modal" style="max-width: 650px; max-height: 85vh; display: flex; flex-direction: column;">
       <div class="modal-header">
-        <h3>🚀 版本更新说明 (v2.2.3)</h3>
+        <h3>🚀 版本更新说明 (v2.2.4)</h3>
         <button class="modal-close" onclick="closeModal('release-notes-modal')">&times;</button>
       </div>
       <div class="modal-body" style="font-size: 13px; line-height: 1.7; color: #334155; overflow-y: auto; max-height: calc(85vh - 120px); display: flex; flex-direction: column; gap: 16px;">
         
-        <!-- v2.2.3 -->
+        <!-- v2.2.4 -->
         <div style="background: #eff6ff; border: 1px solid #bfdbfe; border-radius: 8px; padding: 12px 16px;">
           <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; border-bottom: 1px solid #dbeafe; padding-bottom: 6px;">
-            <div style="font-weight: 700; color: #1d4ed8; font-size: 14.5px;">✨ v2.2.3 纯积分任务模式与保活解耦加固 (最新)</div>
+            <div style="font-weight: 700; color: #1d4ed8; font-size: 14.5px;">✨ v2.2.4 结构性修复 + 移动云底层开机引擎移除 (最新)</div>
+            <div style="color: #64748b; font-size: 12px;">发布时间：2026-09-22</div>
+          </div>
+          <ul style="padding-left: 18px; display: flex; flex-direction: column; gap: 6px; margin: 0;">
+            <li><b>🗑️ 移除移动云「底层开机引擎」（按用户要求）</b>：整体删除 <code>app/ydpc/boot_engine.js</code> —— 该引擎伪造官方 SC 客户端身份、硬编码第三方项目凭据并关闭 TLS 证书校验，直连移动云网关触发开机。<b>移动云侧不再提供任何「开机 / 唤醒」能力</b>（前端按钮、后端接口、调度器自动拉起、保活看门狗均一并移除）；如需开机请在移动云官方 App 连接一次。移动云仍保留账号登录、SOHO 心跳、ZTEC CAG 握手、官方 MQTT 长连接、状态监控与官方<b>关机 / 重启</b>。<b>天翼云功能完全不受影响。</b></li>
+            <li><b>🔧 四类结构根因修复</b>：① 开关语义收敛到单一权威入口（<code>resolveTaskEnabled</code> / <code>TASK_FEATURE_KEY</code>），修正「任务类型 <code>sign</code> vs 字段 <code>autoSign</code>」的字段名漂移，杜绝账号级打卡开关静默失效；② 无客户端在场证据时<b>绝不重连</b>（消除 45 秒循环顶人）；③ 打卡成功判定改为<b>跨分钟以官方数据复检</b>（<code>pendingVerify</code>），未确认绝不虚报成功；④ 网络失败必须展开 <code>err.cause</code> 根因。</li>
+            <li><b>⏱️ 网络请求主动超时</b>：为原生任务链路统一挂载 <code>AbortSignal.timeout</code>，避免单个账号请求挂起导致整个调度队列卡死。</li>
+            <li><b>🧪 新增结构性回归测试网并接入 CI 质量闸门</b>：33 项结构 / 行为断言 + 8 项变异验证（含「底层开机引擎不得复活」专项）。CI 构建前置语法检查与回归测试，任一失败即不构建、不推送镜像。</li>
+          </ul>
+        </div>
+
+        <!-- v2.2.3 -->
+        <div style="background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 8px; padding: 12px 16px;">
+          <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; border-bottom: 1px solid #e2e8f0; padding-bottom: 6px;">
+            <div style="font-weight: 700; color: #334155; font-size: 14.5px;">✨ v2.2.3 纯积分任务模式与保活解耦加固</div>
             <div style="color: #64748b; font-size: 12px;">发布时间：2026-09-21</div>
           </div>
           <ul style="padding-left: 18px; display: flex; flex-direction: column; gap: 6px; margin: 0;">
@@ -941,7 +948,7 @@
             <div style="color: #64748b; font-size: 12px;">发布时间：2026-09-11</div>
           </div>
           <ul style="padding-left: 18px; display: flex; flex-direction: column; gap: 6px; margin: 0;">
-            <li><b>📱 移动云电脑全量融合</b>：中国移动云电脑保活（SOHO REST 签名加密 + ZTEC CAG TCP 三阶段握手 + SC/ZTE 自适应开机），零 Python 依赖，与天翼云同台统一管理、统一配额。</li>
+            <li><b>📱 移动云电脑全量融合</b>：中国移动云电脑保活（SOHO REST 签名加密 + ZTEC CAG TCP 三阶段握手），零 Python 依赖，与天翼云同台统一管理、统一配额。<br><span style="color:#b45309;font-weight:600;">⚠️ 修订（2026-09-22）：原「SC/ZTE 自适应开机」能力已按用户要求整体移除（底层直连开机引擎已删除）。移动云现在只做保活与监控，不提供任何开机入口；如需开机请在移动云官方 App 连接一次。</span></li>
             <li><b>🛡️ 多账号多机全量保活</b>：单账号名下多台云主机全部纳管保活。</li>
             <li><b>🧩 网格自由排版</b>：账号卡片支持拖拽排序与行内留白放置（允许空位、不产生多余空行），布局状态按用户与平台视图持久化，刷新不走样。</li>
             <li><b>🚫 无感刷新与滚动锁定</b>：全面重构为原地增量数据更新（In-Place Update），后台轮询不再整页重绘，彻底消除"刷着刷着跳回顶部"与操作被打断的问题。</li>

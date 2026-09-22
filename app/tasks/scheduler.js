@@ -70,6 +70,25 @@ class TaskScheduler {
     this.isRunning = false;
   }
 
+  /**
+   * 开关语义统一入口 (暗线 A 的结构性修复 · 与 server.js resolveTaskEnabled 同源)
+   * ----------------------------------------------------------
+   * 历史缺陷：调度器各处就地读取 acc.features.autoSign / aiChat / cloudHang / keepAlive，
+   * 与"任务类型常量 sign"之间存在名称漂移风险（打卡的账号级字段叫 autoSign，任务类型叫 sign），
+   * 一旦某处写错字段名，开关就会静默失效 —— 这正是"关掉打卡但任务照跑"类投诉的根源。
+   * 现在统一走 client.resolveTask()；client 不支持时按同一套映射就地兜底。
+   */
+  taskGate(acc, taskType, client) {
+    const c = client || this.getClient(acc);
+    if (c && typeof c.resolveTask === 'function') {
+      return c.resolveTask(taskType).enabled;
+    }
+    // 兜底：与 server.js 的 TASK_FEATURE_KEY 保持一致（sign -> autoSign）
+    const key = taskType === 'sign' ? 'autoSign' : taskType;
+    if (acc.enabled === false) return false;
+    return (acc.features || {})[key] !== false;
+  }
+
   start() {
     this.appendLog('Scheduler', '⏰ 自动化调度引擎已启动 (准时时间点主导 + 30秒无缝巡检)...', 'success');
     // 立即计算并挂载下一次精准时间点延时器
@@ -115,9 +134,9 @@ class TaskScheduler {
     for (const acc of accounts) {
       if (!acc.enabled || acc.platform === 'ydpc') continue;
       const f = acc.features || {};
-      if ((f.autoSign !== false && !subCronMap.sign) ||
-          (f.aiChat !== false && !subCronMap.aiChat) ||
-          (f.cloudHang !== false && !subCronMap.cloudHang) ||
+      if ((this.taskGate(acc, 'sign') && !subCronMap.sign) ||
+          (this.taskGate(acc, 'aiChat') && !subCronMap.aiChat) ||
+          (this.taskGate(acc, 'cloudHang') && !subCronMap.cloudHang) ||
           (f.autoRedeem && !subCronMap.redeem)) {
         anyUngovernedTask = true;
         break;
@@ -145,15 +164,15 @@ class TaskScheduler {
       const aiTask = tasks.find(t => t.name.includes('AI对话'));
       const hangTask = tasks.find(t => t.name.includes('使用1小时'));
 
-      if (f.autoSign !== false && !subCronMap.sign && !(loginTask && (loginTask.status === 2 || loginTask.current >= loginTask.total))) {
+      if (this.taskGate(acc, 'sign') && !subCronMap.sign && !(loginTask && (loginTask.status === 2 || loginTask.current >= loginTask.total))) {
         allDone = false;
         break;
       }
-      if (f.aiChat !== false && !subCronMap.aiChat && !(aiTask && (aiTask.status === 2 || aiTask.current >= aiTask.total))) {
+      if (this.taskGate(acc, 'aiChat') && !subCronMap.aiChat && !(aiTask && (aiTask.status === 2 || aiTask.current >= aiTask.total))) {
         allDone = false;
         break;
       }
-      if (f.cloudHang !== false && !subCronMap.cloudHang && !(hangTask && (hangTask.status === 2 || hangTask.current >= hangTask.total))) {
+      if (this.taskGate(acc, 'cloudHang') && !subCronMap.cloudHang && !(hangTask && (hangTask.status === 2 || hangTask.current >= hangTask.total))) {
         allDone = false;
         break;
       }
@@ -321,7 +340,7 @@ class TaskScheduler {
         this.lastTriggerMinute = currentMinKey;
         this.appendLog('Scheduler', `⏰ 触发分项辅助规则 [签到打卡] (Cron: ${cron.signCron})...`, 'info');
         for (const acc of accounts) {
-          if (acc.features?.autoSign !== false) {
+          if (this.taskGate(acc, 'sign')) {
             const client = this.getClient(acc);
             executeNativeSign(client, acc, (src, msg, lvl) => this.appendLog(src, `[${acc.name}] ${msg}`, lvl))
               .then(signRes => {
@@ -337,7 +356,7 @@ class TaskScheduler {
     } else if (targetTimes.includes(currentHm) && this.lastCompletedDate !== todayStr) {
       // 辅助规则未配置该项，按主时间点兜底
       for (const acc of accounts) {
-        if (acc.features?.autoSign !== false) {
+        if (this.taskGate(acc, 'sign')) {
           const client = this.getClient(acc);
           executeNativeSign(client, acc, (src, msg, lvl) => this.appendLog(src, `[${acc.name}] ${msg}`, lvl))
             .then(signRes => {
@@ -357,7 +376,7 @@ class TaskScheduler {
         this.lastTriggerMinute = currentMinKey;
         this.appendLog('Scheduler', `⏰ 触发分项辅助规则 [AI 对话] (Cron: ${cron.aiChatCron})...`, 'info');
         for (const acc of accounts) {
-          if (acc.features?.aiChat !== false) {
+          if (this.taskGate(acc, 'aiChat')) {
             const client = this.getClient(acc);
             executeNativeAiChat(client, acc, (src, msg, lvl) => this.appendLog(src, `[${acc.name}] ${msg}`, lvl)).catch(() => {});
           }
@@ -366,7 +385,7 @@ class TaskScheduler {
     } else if (targetTimes.includes(currentHm) && this.lastCompletedDate !== todayStr) {
       // 辅助规则未配置该项，按主时间点兜底
       for (const acc of accounts) {
-        if (acc.features?.aiChat !== false) {
+        if (this.taskGate(acc, 'aiChat')) {
           const client = this.getClient(acc);
           executeNativeAiChat(client, acc, (src, msg, lvl) => this.appendLog(src, `[${acc.name}] ${msg}`, lvl)).catch(() => {});
         }
@@ -379,7 +398,7 @@ class TaskScheduler {
         this.lastTriggerMinute = currentMinKey;
         this.appendLog('Scheduler', `⏰ 触发分项辅助规则 [云电脑挂机] (Cron: ${cron.cloudHangCron})...`, 'info');
         for (const acc of accounts) {
-          if (acc.features?.cloudHang !== false) {
+          if (this.taskGate(acc, 'cloudHang')) {
             const client = this.getClient(acc);
             executeNativeHang(client, acc, (src, msg, lvl) => this.appendLog(src, `[${acc.name}] ${msg}`, lvl)).catch(() => {});
           }
@@ -388,7 +407,7 @@ class TaskScheduler {
     } else if (targetTimes.includes(currentHm) && this.lastCompletedDate !== todayStr) {
       // 辅助规则未配置该项，按主时间点兜底
       for (const acc of accounts) {
-        if (acc.features?.cloudHang !== false && acc.platform !== 'ydpc') {
+        if (this.taskGate(acc, 'cloudHang') && acc.platform !== 'ydpc') {
           const client = this.getClient(acc);
           executeNativeHang(client, acc, (src, msg, lvl) => this.appendLog(src, `[${acc.name}] ${msg}`, lvl)).catch(() => {});
         }
@@ -428,6 +447,13 @@ class TaskScheduler {
     if (this.isRunning) return;
     this.isRunning = true;
 
+    // isRunning 必须用 try/finally 复位 (新发现 #32)：
+    // 原实现把 this.isRunning = false 放在函数末尾，若末尾的通知/日志/落盘任一处抛错，
+    // isRunning 会永久停留在 true —— 调度器从此静默死锁，此后所有账号的所有任务都不再执行，
+    // 而日志里没有任何异常提示。用户只能看到"任务没跑"。
+    // 以下 try 块内的缩进保持原样，以便审阅时 diff 最小化。
+    try {
+
     const todayStr = getBeijingDateStr();
     const accounts = (this.getAccounts() || []).filter(a => a.enabled);
 
@@ -447,7 +473,9 @@ class TaskScheduler {
       const client = this.getClient(acc);
       const accSummary = { name: acc.name, sign: false, aiChat: false, hang: false };
 
-      // 移动云电脑 (YDPc) 独立调度分支：执行 SOHO 心跳、CAG TCP 握手与关机自动拉起
+      // 移动云电脑 (YDPc) 独立调度分支：仅执行 SOHO 心跳与 CAG TCP 握手保活
+      // 【2026-09-22 用户要求】原"关机自动拉起"已随底层开机引擎 (boot_engine) 一并移除，
+      // 本分支不再下发任何电源指令。
       if (acc.platform === 'ydpc') {
         try {
           this.appendLog('Scheduler', `[${acc.name}] 正在执行移动云电脑例行保活巡检...`, 'info', acc.name, 'ydpc');
@@ -455,11 +483,6 @@ class TaskScheduler {
           const vms = acc.vms || client.metrics?.vms || [];
           for (const vm of vms) {
             if (vm.keepaliveEnabled !== false) {
-              const isAutoBoot = acc.features?.autoBoot !== false && vm.autoBootEnabled !== false;
-              if (isAutoBoot && (vm.vmStatus === '已关机' || String(vm.vmStatus || '').includes('关机') || vm.vmStatusCode === 23 || vm.vmStatusCode === 16)) {
-                this.appendLog('SOHO', `[${acc.name}][${vm.vmName}] 检测到已关机，下发【自动开机守护】...`, 'warning', acc.name, 'ydpc');
-                if (client.bootVm) await client.bootVm(vm.userServiceId).catch(() => {});
-              }
               if (acc.features?.sohoHeartbeat !== false && client.sendHeartbeat) {
                 await client.sendHeartbeat(vm.userServiceId).catch(() => {});
               }
@@ -489,12 +512,12 @@ class TaskScheduler {
 
       try {
         // 1. 底层 WSS 长连接保活守护 (避免被踢) —— 仅在保活开关开启时拉起，尊重用户主动关机保护
-        if (!client.wsAlive && acc.features?.keepAlive !== false) {
+        if (!client.wsAlive && this.taskGate(acc, 'keepAlive')) {
           client.startKeepAliveWorker();
         }
 
         // 2. 原生登录打卡 (分项 Cron 管辖时主调度跳过)
-        if (acc.features?.autoSign !== false) {
+        if (this.taskGate(acc, 'sign')) {
           if (excludeSet?.sign) {
             this.appendLog('Scheduler', `[${acc.name}] 分项 [每日签到] 由独立 Cron 管辖，本次主调度跳过。`, 'info');
           } else {
@@ -513,7 +536,7 @@ class TaskScheduler {
         }
 
         // 3. 原生毫秒级 AI 智能对话 (彻底剔除 Chromium) (分项 Cron 管辖时主调度跳过)
-        if (acc.features?.aiChat !== false) {
+        if (this.taskGate(acc, 'aiChat')) {
           if (excludeSet?.aiChat) {
             this.appendLog('Scheduler', `[${acc.name}] 分项 [AI 对话] 由独立 Cron 管辖，本次主调度跳过。`, 'info');
           } else {
@@ -529,7 +552,7 @@ class TaskScheduler {
         }
 
         // 4. 原生云电脑挂机守护检测 (分项 Cron 管辖时主调度跳过)
-        if (acc.features?.cloudHang !== false) {
+        if (this.taskGate(acc, 'cloudHang')) {
           if (excludeSet?.cloudHang) {
             this.appendLog('Scheduler', `[${acc.name}] 分项 [云电脑挂机] 由独立 Cron 管辖，本次主调度跳过。`, 'info');
           } else {
@@ -720,13 +743,13 @@ class TaskScheduler {
       const aiTask = tasks.find(t => t.name.includes('AI对话'));
       const hangTask = tasks.find(t => t.name.includes('使用1小时'));
 
-      if (acc.features?.autoSign !== false && !(loginTask && (loginTask.status === 2 || loginTask.current >= loginTask.total))) {
+      if (this.taskGate(acc, 'sign') && !(loginTask && (loginTask.status === 2 || loginTask.current >= loginTask.total))) {
         allAccountsFullyDone = false;
       }
-      if (acc.features?.aiChat !== false && !(aiTask && (aiTask.status === 2 || aiTask.current >= aiTask.total))) {
+      if (this.taskGate(acc, 'aiChat') && !(aiTask && (aiTask.status === 2 || aiTask.current >= aiTask.total))) {
         allAccountsFullyDone = false;
       }
-      if (acc.features?.cloudHang !== false && !(hangTask && (hangTask.status === 2 || hangTask.current >= hangTask.total))) {
+      if (this.taskGate(acc, 'cloudHang') && !(hangTask && (hangTask.status === 2 || hangTask.current >= hangTask.total))) {
         allAccountsFullyDone = false;
       }
     }
@@ -734,12 +757,11 @@ class TaskScheduler {
     if (allAccountsFullyDone) {
       this.lastCompletedDate = todayStr;
       this.appendLog('Scheduler', `🎉 今日云电脑全部自动化任务已圆满达成！做完即标记今日达成，当天绝不再空转。`, 'success');
-      const detailText = summaryResults.map(r => {
-        const signTxt = r.sign ? '已达成' : '已达成';
-        const aiTxt = r.aiChat ? '已达成' : '已达成';
-        const hangTxt = r.hang ? '已满1小时' : '已达成';
-        return `• ${r.name}: 打卡[${signTxt}], AI对话[${aiTxt}], 挂机1小时[${hangTxt}]`;
-      }).join('\n');
+      // 此处已通过 allAccountsFullyDone 的严格校验 (逐账号核对官方任务中心)，故可如实写"已达成"。
+      // 原实现是 `r.sign ? '已达成' : '已达成'` 这类两个分支完全相同的死代码，属虚报隐患 (新发现 #34)。
+      const detailText = summaryResults.map(r =>
+        `• ${r.name}: 打卡[已达成], AI对话[已达成], 挂机1小时[已满1小时]`
+      ).join('\n');
       this.sendNotification(
         this.getSettings(),
         `🎉 天翼云电脑今日任务圆满达成 (${todayStr})`,
@@ -747,12 +769,13 @@ class TaskScheduler {
       );
     } else {
       const anySignPending = summaryResults.some(r => !r.sign);
-      const signStatusNote = anySignPending ? '打卡已建立认领观察' : '打卡已完成';
-      this.appendLog('Scheduler', `⚡ 定时任务已执行 (${signStatusNote})，长连接正在后台持续挂机累加时长直至满 1 小时达成...`, 'info');
+      const signStatusNote = anySignPending ? '打卡已认领、等待官方确认 (系统会自动复检)' : '打卡已完成';
+      this.appendLog('Scheduler', `⚡ 定时任务已执行 (${signStatusNote})。注意：打卡与挂机的最终成败一律以官方任务中心为准。`, 'info');
+      // 措辞一律不得暗示"已成功"：认领下发 ≠ 达成，挂机启动 ≠ 达成
       const detailText = summaryResults.map(r => {
-        const signTxt = r.sign ? '已完成' : '认领已下发待确认(挂机中自动累加)';
-        const aiTxt = r.aiChat ? '已完成' : '跳过/未执行';
-        const hangTxt = r.hang ? '已达标' : '后台挂机累加中';
+        const signTxt = r.sign ? '官方已确认达成' : '认领已下发，待官方确认 (自动复检中)';
+        const aiTxt = r.aiChat ? '官方已确认达成' : '未确认，请刷新查看';
+        const hangTxt = r.hang ? '官方已确认达成' : '尚未达成，后台续跑中';
         return `• ${r.name}: 打卡[${signTxt}], AI对话[${aiTxt}], 挂机1小时[${hangTxt}]`;
       }).join('\n');
       this.sendNotification(
@@ -762,7 +785,9 @@ class TaskScheduler {
       );
     }
 
-    this.isRunning = false;
+    } finally {
+      this.isRunning = false;
+    }
   }
 }
 
