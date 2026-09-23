@@ -1031,6 +1031,13 @@ class CtYunClient {
    *   - 误判为 false_alarm  → 代价是把正在使用云电脑的真实用户顶下线 (不可接受)
    * 因此凡"取不到可信证据"一律返回 'unverified'，并由调用方按 real_client 处理。
    * 这正是历史上"没有证据被当成没有用户"的反面。
+   *
+   * 【2026-09-23 用户实测调整】观察总时长 90 秒 → 5 分钟。
+   * 背景：用户实测「90 秒内官方挂机计时并未增长，但人确实在用」，导致误判为无人在用而被反复顶下线。
+   * 用户要求先验证"是不是 90 秒太短、不足以等到官方落账变化"，故把采样跨度拉到 5 分钟。
+   * 注意：本调整**只在"官方计时为延迟落账"时有效**。若 5 分钟内仍恒定不变，
+   * 则说明计时根本不随我们的协议会话推进（按官方客户端会话结算），
+   * 此时延长窗口无效，须改为"取不到增长证据一律按可能有真人处理"（翻转判定方向）。
    */
   async diagnoseHangInterruption(onLog = console.log, targetName = '云电脑', preRefresh = null) {
     const accName = this.account.name || this.account.user;
@@ -1047,26 +1054,37 @@ class CtYunClient {
     if (this.isTodayHangTaskCompleted()) return 'completed';
 
     const before = getUsage();
-    onLog('Hang', `[${targetName}] 🔎 正在鉴别中断来源 (观察约 90 秒，检查官方计时是否继续增长；当前 ${before}s)...`, 'info');
 
-    // 两次采样，取最大增量，避免官方按分钟粒度落账时恰好错过一次跳变
+    // 观察参数：5 次采样 × 60 秒 = 总跨度 5 分钟（用户指定）。
+    // 采样间隔仍取 60 秒，是为了覆盖官方"按分钟粒度落账"的跳变边界 ——
+    // 一次性只睡 5 分钟再取值，可能恰好落在两次跳变之间而看不到增量。
+    const DIAG_SAMPLES = 5;
+    const DIAG_GAP_MS = 60000;
+    const totalMin = Math.round((DIAG_SAMPLES * DIAG_GAP_MS) / 60000);
+    onLog('Hang', `[${targetName}] 🔎 正在鉴别中断来源 (观察约 ${totalMin} 分钟，检查官方计时是否继续增长；当前 ${before}s)...`, 'info');
+
     let maxSeen = before;
-    for (let i = 0; i < 2; i++) {
-      await new Promise(r => setTimeout(r, 45000));
+    for (let i = 0; i < DIAG_SAMPLES; i++) {
+      await new Promise(r => setTimeout(r, DIAG_GAP_MS));
       const r = await this.refreshOfficialTasks();
       if (!r || r.ok === false) {
         appendLog('Hang', `[${accName}][${targetName}] 🔎 鉴别过程第 ${i + 1} 次取值失败 (${(r && r.reason) || '原因未知'})，无法形成结论，按"可能有真机用户"处理。`, 'warning');
         return 'unverified';
       }
       if (this.isTodayHangTaskCompleted()) return 'completed';
-      maxSeen = Math.max(maxSeen, getUsage());
+      const seen = getUsage();
+      maxSeen = Math.max(maxSeen, seen);
+      appendLog('Hang', `[${accName}][${targetName}] 🔎 鉴别采样 ${i + 1}/${DIAG_SAMPLES} (第 ${(i + 1)} 分钟)：官方计时 ${seen}s (初始 ${before}s，最大 ${maxSeen}s)。`, 'info');
     }
 
     const delta = maxSeen - before;
     // 阈值取 30 秒：本会话此时已断开，官方计时若仍在增长即说明另有他人在使用。
-    // 我们自身会话的延迟落账也会表现为增长 —— 同样导向"让位"，属于安全方向。
+    // 【已知局限】"计时未增长"是否等价于"无人在用"，尚待本次 5 分钟实测验证 ——
+    // 用户曾实测 90 秒内计时不涨却确实在用，若 5 分钟仍不涨，则本条注释的前提不成立，
+    // 需按上方函数注释所述翻转判定方向。
+
     const verdict = delta >= 30 ? 'real_client' : 'false_alarm';
-    appendLog('Hang', `[${accName}][${targetName}] 中断鉴别结果: 90 秒内官方计时 ${before}s → ${maxSeen}s (增量 ${delta}s)，判定 = ${verdict === 'real_client' ? '真实客户端正在使用 (计时持续增长)，必须让位' : '无人在用 (计时冻结)，可安全续连'}`, 'info');
+    appendLog('Hang', `[${accName}][${targetName}] 中断鉴别结果: ${totalMin} 分钟内官方计时 ${before}s → ${maxSeen}s (增量 ${delta}s)，判定 = ${verdict === 'real_client' ? '真实客户端正在使用 (计时持续增长)，必须让位' : '无人在用 (计时冻结)，可安全续连'}`, 'info');
     return verdict;
   }
 

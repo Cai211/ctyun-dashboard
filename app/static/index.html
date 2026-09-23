@@ -841,7 +841,7 @@
       <div>云电脑可视化全功能多账号管理平台 · 纯协议超轻量架构</div>
       <div style="margin-top: 6px;" id="footer-version-container">
         <span id="footer-version-badge" style="color: var(--text-muted); cursor: default;">
-          📌 当前版本: v2.2.4
+          📌 当前版本: v2.2.5
         </span>
       </div>
     </footer>
@@ -851,15 +851,28 @@
   <div class="modal-backdrop hidden" id="release-notes-modal">
     <div class="modal" style="max-width: 650px; max-height: 85vh; display: flex; flex-direction: column;">
       <div class="modal-header">
-        <h3>🚀 版本更新说明 (v2.2.4)</h3>
+        <h3>🚀 版本更新说明 (v2.2.5)</h3>
         <button class="modal-close" onclick="closeModal('release-notes-modal')">&times;</button>
       </div>
       <div class="modal-body" style="font-size: 13px; line-height: 1.7; color: #334155; overflow-y: auto; max-height: calc(85vh - 120px); display: flex; flex-direction: column; gap: 16px;">
         
-        <!-- v2.2.4 -->
+        <!-- v2.2.5 -->
         <div style="background: #eff6ff; border: 1px solid #bfdbfe; border-radius: 8px; padding: 12px 16px;">
           <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; border-bottom: 1px solid #dbeafe; padding-bottom: 6px;">
-            <div style="font-weight: 700; color: #1d4ed8; font-size: 14.5px;">✨ v2.2.4 结构性修复 + 移动云底层开机引擎移除 (最新)</div>
+            <div style="font-weight: 700; color: #1d4ed8; font-size: 14.5px;">✨ v2.2.5 挂机中断鉴别观察窗延长至 5 分钟 (最新)</div>
+            <div style="color: #64748b; font-size: 12px;">发布时间：2026-09-23</div>
+          </div>
+          <ul style="padding-left: 18px; display: flex; flex-direction: column; gap: 6px; margin: 0;">
+            <li><b>🔍 挂机中断鉴别的观察窗由 90 秒延长至 5 分钟</b>：当挂机长连接被断开时，系统需要判断"是不是有真人在使用云电脑"。原实现只观察 90 秒，实测该窗口内官方挂机计时可能尚未落账变化，导致误判为"无人在用"而重新认领，从而把正在使用的用户顶下线。<br>现改为 <b>5 次采样 × 60 秒 = 总计 5 分钟</b>：<br>· 采样间隔保留 60 秒，以覆盖官方"按分钟粒度落账"的跳变边界（若只睡 5 分钟取一次，可能落在两次跳变之间而看不到增量）；<br>· 每轮采样都会记录日志（<code>🔎 鉴别采样 N/5</code>），可据此判断官方计时究竟需要多久才会变化；<br>· 判定阈值仍为 30 秒增量：<b>计时增长 → 判定有真人在用，立即让位避让；计时冻结 → 判定无人在用，允许重连续挂</b>。</li>
+            <li><b>📊 便于定位根因的采样日志</b>：新增逐分钟采样日志，可直观看出"官方计时在 5 分钟内是否变化、第几分钟开始变化"，为后续是否需要进一步调整判定策略提供实测依据。</li>
+            <li><b>⚠️ 已知局限（如实说明）</b>：本调整只在"官方计时属于延迟落账"时有效。若 5 分钟内计时仍恒定不变，则说明该计时不随本系统的协议会话推进（可能按官方客户端会话结算），此时延长窗口无效，需要改为"取不到计时增长证据时，一律按可能有真人处理（不重连）"。此判断需以实际日志为准。</li>
+          </ul>
+        </div>
+
+        <!-- v2.2.4 -->
+        <div style="background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 8px; padding: 12px 16px;">
+          <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; border-bottom: 1px solid #e2e8f0; padding-bottom: 6px;">
+            <div style="font-weight: 700; color: #334155; font-size: 14.5px;">✨ v2.2.4 结构性修复 + 移动云底层开机引擎移除</div>
             <div style="color: #64748b; font-size: 12px;">发布时间：2026-09-22</div>
           </div>
           <ul style="padding-left: 18px; display: flex; flex-direction: column; gap: 6px; margin: 0;">
